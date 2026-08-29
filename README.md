@@ -12,7 +12,8 @@
 - 🌈 **Dynamic Audio Waveform**: Real-time 5-color animated equalizer visualizer for active voice recording.
 - ⚡ **Seamless Speech Models**: On-the-fly switching between local zero-latency Whisper and Google Gemini Cloud reasoning models.
 - ⌨️ **System-Wide Keybindings**: Start, toggle, pause, or auto-submit dictation anywhere in your desktop environment.
-- 🧩 **Omarchy Bar Widget**: Status bar icon with live recording indicator (`󰍬` / `󰍭`), pause state (`󰏤`), and left/right click controls.
+- 🧩 **Omarchy Bar Widget**: Theme-adaptive Flow mark with live recording state, a full settings menu, and left/right click controls.
+- ⚙️ **Settings Hub**: Configure the default model, toggle completion, clipboard behavior, audio input, HUD position, waveform visibility, global shortcuts, diagnostics, and privacy details.
 - 🔒 **Secure Credential Resolution**: Automatic API key discovery from environment variables, Secret Service/GNOME Keyring, and private XDG config files.
 
 ## 📦 Install
@@ -27,6 +28,12 @@ omarchy plugin add https://github.com/EF-Code/omarchy-flow.git --enable
 # Place the widget in your bar
 omarchy bar move io.github.ef-code.omarchy-flow --section right
 ```
+
+Left-click the Flow mark to open the action menu. Choose **Settings** to
+configure Flow without editing files. The settings hub includes editable
+Hyprland shortcuts, a microphone source picker, a short microphone test,
+dependency diagnostics, and HUD controls. Right-click remains the quick
+recording action.
 
 ### Dependencies and credentials
 
@@ -66,9 +73,13 @@ omarchy plugin remove io.github.ef-code.omarchy-flow
 
 ---
 
-## 🚀 Keybinding Configuration (`hyprland.conf`)
+## 🚀 Keyboard shortcuts
 
-Add the following keybindings to `~/.config/hypr/hyprland.conf`:
+The Settings menu can install and reload a managed Flow shortcut block in your
+Hyprland bindings. It leaves the rest of your configuration intact and shows
+existing bindings on the selected keys before applying changes.
+
+For manual setup, add the following keybindings to `~/.config/hypr/hyprland.conf`:
 
 ```ini
 # Omarchy Flow — Voice Dictation Keybindings
@@ -121,6 +132,7 @@ Omarchy Flow includes a standalone CLI dispatcher for shell automation and scrip
 
 - **`Pill.qml`**: Floating liquid-glass HUD pill overlay (`WlrLayer.Overlay`).
 - **`BarWidget.qml`**: Status bar widget with reactive status indicator.
+- **`SettingsView.qml`**: Settings hub for behavior, shortcuts, audio/privacy, HUD, diagnostics, and about information.
 - **`Service.qml`**: Background Quickshell service hosting the system IPC target.
 - **`scripts/gemini-dictate.py`**: Audio recording, local VAD, Whisper / Gemini transcription engine.
 - **`scripts/flowctl`**: Command-line dispatcher and Hyprland keybinding endpoint.
