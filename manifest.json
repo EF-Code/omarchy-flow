@@ -19,7 +19,7 @@
   },
   "barWidget": {
     "displayName": "Omarchy Flow",
-    "description": "Voice dictation HUD, speech model switcher, and recording controller.",
+    "description": "Voice dictation HUD, settings hub, speech model switcher, and recording controller.",
     "category": "Input & AI",
     "aliases": [
       "dictate",
