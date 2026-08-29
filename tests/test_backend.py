@@ -70,6 +70,7 @@ class TestFlowBackend(unittest.TestCase):
                 "LOCK_FILE",
                 "MODEL_FILE",
                 "LEGACY_MODEL_FILE",
+                "SETTINGS_FILE",
                 "LEGACY_RUNTIME_DIR",
                 "LEGACY_TEMP_AUDIO",
                 "LEGACY_PID_FILE",
@@ -93,6 +94,7 @@ class TestFlowBackend(unittest.TestCase):
         backend.LOCK_FILE = str(Path(backend.RUNTIME_DIR) / "operation.lock")
         backend.MODEL_FILE = str(self.config_dir / "selected_model.txt")
         backend.LEGACY_MODEL_FILE = str(self.legacy_config_dir / "selected_model.txt")
+        backend.SETTINGS_FILE = str(self.config_dir / "settings.json")
         backend.LEGACY_RUNTIME_DIR = str(self.legacy_runtime)
         backend.LEGACY_TEMP_AUDIO = str(self.legacy_runtime / "gemini_dictation.wav")
         backend.LEGACY_PID_FILE = str(self.legacy_runtime / "gemini_dictation.pid")
@@ -154,10 +156,85 @@ class TestFlowBackend(unittest.TestCase):
         Path(backend.MODEL_FILE).write_text("not-a-real-model\n")
         os.chmod(backend.MODEL_FILE, 0o600)
         self.assertEqual(backend.get_selected_model(), "whisper-base.en")
-
         Path(backend.LEGACY_MODEL_FILE).write_text("removed-model\n")
         os.chmod(backend.LEGACY_MODEL_FILE, 0o600)
         self.assertEqual(backend.get_selected_model(), "whisper-base.en")
+
+    def test_settings_defaults_and_persistence(self):
+        settings = backend.get_settings()
+        self.assertEqual(settings["toggle_action"], "transcribe")
+        self.assertEqual(settings["audio_source"], "default")
+        self.assertTrue(settings["copy_to_clipboard"])
+        self.assertTrue(backend.set_setting("toggle_action", "submit"))
+        self.assertTrue(backend.set_setting("copy_to_clipboard", "false"))
+        self.assertTrue(backend.set_setting("hotkeys.toggle", "ctrl + shift + f6"))
+        updated = backend.get_settings()
+        self.assertEqual(updated["toggle_action"], "submit")
+        self.assertFalse(updated["copy_to_clipboard"])
+        self.assertEqual(updated["hotkeys"]["toggle"], "CTRL + SHIFT + F6")
+        self.assertEqual(file_mode(backend.SETTINGS_FILE), 0o600)
+
+    def test_settings_reject_invalid_values(self):
+        original = backend.get_settings()
+        self.assertFalse(backend.set_setting("toggle_action", "send-email"))
+        self.assertFalse(backend.set_setting("audio_source", "source with spaces"))
+        self.assertFalse(backend.set_setting("hud_position", "left"))
+        self.assertFalse(backend.set_setting("hotkeys.toggle", "SUPER + SUPER + V"))
+        self.assertEqual(backend.get_settings(), original)
+
+    def test_audio_source_listing_filters_non_input_nodes(self):
+        pactl_output = json.dumps([
+            {
+                "name": "speaker.monitor",
+                "description": "Monitor",
+                "properties": {"media.class": "Audio/Sink"},
+            },
+            {
+                "name": "desk-mic",
+                "description": "Desk microphone",
+                "properties": {"media.class": "Audio/Source"},
+            },
+        ])
+        result = subprocess.CompletedProcess(args=[], returncode=0, stdout=pactl_output, stderr="")
+        with patch("subprocess.run", return_value=result):
+            sources = backend.list_audio_sources()
+        self.assertEqual(sources, [
+            {"id": "default", "name": "System default"},
+            {"id": "desk-mic", "name": "Desk microphone"},
+        ])
+
+    def test_toggle_uses_saved_completion_action(self):
+        self.assertTrue(backend.set_setting("toggle_action", "submit"))
+        with patch.object(backend, "_active_recording_pids", return_value=[12345]), patch.object(
+            backend, "_stop_recording", return_value=True
+        ) as stop:
+            self.assertTrue(backend.toggle_recording())
+        stop.assert_called_once_with(auto_submit=True, pids=[12345])
+
+    def test_apply_hotkeys_writes_managed_block(self):
+        reload_ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        def fake_run(args, **kwargs):
+            if args == ["hyprctl", "reload"] or args == ["hyprctl", "configerrors"]:
+                return reload_ok
+            raise AssertionError(f"unexpected subprocess call: {args}")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            self.assertTrue(backend.apply_hotkeys({
+                "toggle": "SUPER + ALT + F6",
+                "toggle_submit": "",
+                "push_to_talk": "F7",
+                "pause": "SUPER + ALT + P",
+                "cancel": "SUPER + ALT + C",
+            }))
+
+        bindings_path = Path(backend.XDG_CONFIG_HOME) / "hypr" / "bindings.lua"
+        content = bindings_path.read_text()
+        self.assertIn(backend.HOTKEY_MARKER_START, content)
+        self.assertIn('o.bind("SUPER + ALT + F6"', content)
+        self.assertIn('o.bind("F7", "Flow: Push to talk (release)"', content)
+        self.assertNotIn("toggleSubmit", content)
+        self.assertEqual(backend.get_settings()["hotkeys"]["toggle_submit"], "")
 
     def test_get_current_state(self):
         state = backend.get_current_state()
