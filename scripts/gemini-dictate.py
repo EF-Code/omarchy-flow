@@ -10,6 +10,7 @@ import sys
 import re
 import time
 import json
+import copy
 import glob
 import contextlib
 import fcntl
@@ -19,6 +20,7 @@ import subprocess
 import datetime
 import tempfile
 import warnings
+import shutil
 
 # Dynamically discover and include virtual environment site-packages (e.g. ~/.venv)
 def _ensure_venv_packages():
@@ -94,6 +96,7 @@ STATE_FILE = os.path.join(RUNTIME_DIR, "state.json")
 LOCK_FILE = os.path.join(RUNTIME_DIR, "operation.lock")
 MODEL_FILE = os.path.join(CONFIG_DIR, "selected_model.txt")
 LEGACY_MODEL_FILE = os.path.join(LEGACY_CONFIG_DIR, "selected_model.txt")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 
 # Legacy compatibility files. They are only read/written when they are owned
 # by the current user and are never followed as symlinks.
@@ -110,6 +113,43 @@ SUPPORTED_MODELS = [
 
 DEFAULT_MODEL_ID = SUPPORTED_MODELS[0]["id"]
 SUPPORTED_MODEL_IDS = frozenset(model["id"] for model in SUPPORTED_MODELS)
+
+DEFAULT_SETTINGS = {
+    "toggle_action": "transcribe",
+    "audio_source": "default",
+    "copy_to_clipboard": True,
+    "hud_enabled": True,
+    "hud_position": "bottom",
+    "waveform_enabled": True,
+    "hotkeys": {
+        "toggle": "SUPER + ALT + V",
+        "toggle_submit": "SUPER + ALT + SHIFT + V",
+        "push_to_talk": "F6",
+        "pause": "SUPER + ALT + P",
+        "cancel": "SUPER + ALT + C",
+    },
+}
+
+HOTKEY_MODIFIERS = {
+    "SUPER": "SUPER",
+    "META": "SUPER",
+    "WIN": "SUPER",
+    "MOD4": "SUPER",
+    "CTRL": "CTRL",
+    "CONTROL": "CTRL",
+    "ALT": "ALT",
+    "SHIFT": "SHIFT",
+}
+HOTKEY_MODMASKS = {"SHIFT": 1, "CTRL": 4, "ALT": 8, "SUPER": 64}
+HOTKEY_IDS = (
+    "toggle",
+    "toggle_submit",
+    "push_to_talk",
+    "pause",
+    "cancel",
+)
+HOTKEY_MARKER_START = "-- >>> omarchy-flow managed hotkeys >>>"
+HOTKEY_MARKER_END = "-- <<< omarchy-flow managed hotkeys <<<"
 
 for directory in [CONFIG_DIR, RUNTIME_DIR, STATE_DIR]:
     try:
@@ -196,6 +236,452 @@ def _write_private_text(path, content):
     finally:
         if temporary_path:
             _remove_owned_path(temporary_path)
+
+
+def _coerce_bool(value, fallback):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return fallback
+
+
+def _normalise_audio_source(value):
+    if value is None:
+        return None
+    source = str(value).strip()
+    if source == "default":
+        return source
+    if not source or len(source) > 255 or not re.fullmatch(r"[A-Za-z0-9_.:@%/-]+", source):
+        return None
+    return source
+
+
+def _normalise_hotkey(value):
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return ""
+
+    parts = [part.strip() for part in raw.split("+")]
+    if not parts or any(not part for part in parts):
+        return None
+
+    modifiers = []
+    for part in parts[:-1]:
+        modifier = HOTKEY_MODIFIERS.get(part)
+        if modifier is None or modifier in modifiers:
+            return None
+        modifiers.append(modifier)
+
+    key = parts[-1]
+    if key in HOTKEY_MODIFIERS or not re.fullmatch(r"[A-Z0-9][A-Z0-9:_-]*", key):
+        return None
+
+    ordered_modifiers = [
+        modifier for modifier in ("SUPER", "CTRL", "ALT", "SHIFT") if modifier in modifiers
+    ]
+    return " + ".join(ordered_modifiers + [key])
+
+
+def _normalise_settings(raw):
+    settings = copy.deepcopy(DEFAULT_SETTINGS)
+    if not isinstance(raw, dict):
+        return settings
+
+    toggle_action = str(raw.get("toggle_action", settings["toggle_action"])).strip().lower()
+    if toggle_action in {"transcribe", "submit"}:
+        settings["toggle_action"] = toggle_action
+
+    audio_source = _normalise_audio_source(raw.get("audio_source", settings["audio_source"]))
+    if audio_source:
+        settings["audio_source"] = audio_source
+
+    for key in ["copy_to_clipboard", "hud_enabled", "waveform_enabled"]:
+        settings[key] = _coerce_bool(raw.get(key), settings[key])
+
+    hud_position = str(raw.get("hud_position", settings["hud_position"])).strip().lower()
+    if hud_position in {"top", "bottom"}:
+        settings["hud_position"] = hud_position
+
+    raw_hotkeys = raw.get("hotkeys")
+    if isinstance(raw_hotkeys, dict):
+        for hotkey_id in HOTKEY_IDS:
+            if hotkey_id not in raw_hotkeys:
+                continue
+            normalised = _normalise_hotkey(raw_hotkeys[hotkey_id])
+            if normalised is not None:
+                settings["hotkeys"][hotkey_id] = normalised
+
+    return settings
+
+
+def get_settings():
+    raw = _read_owned_text(SETTINGS_FILE)
+    if raw is None:
+        return copy.deepcopy(DEFAULT_SETTINGS)
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        log("Ignoring invalid settings file")
+        return copy.deepcopy(DEFAULT_SETTINGS)
+    return _normalise_settings(parsed)
+
+
+def _write_settings(settings):
+    _ensure_private_dir(CONFIG_DIR)
+    _write_private_text(SETTINGS_FILE, json.dumps(_normalise_settings(settings), separators=(",", ":")))
+
+
+def set_setting(key, value):
+    settings = get_settings()
+    if key == "toggle_action":
+        normalised = str(value).strip().lower()
+        if normalised not in {"transcribe", "submit"}:
+            return False
+        settings[key] = normalised
+    elif key == "audio_source":
+        normalised = _normalise_audio_source(value)
+        if normalised is None:
+            return False
+        settings[key] = normalised
+    elif key in {"copy_to_clipboard", "hud_enabled", "waveform_enabled"}:
+        normalised = _coerce_bool(value, None)
+        if normalised is None:
+            return False
+        settings[key] = normalised
+    elif key == "hud_position":
+        normalised = str(value).strip().lower()
+        if normalised not in {"top", "bottom"}:
+            return False
+        settings[key] = normalised
+    elif key.startswith("hotkeys."):
+        hotkey_id = key.split(".", 1)[1]
+        if hotkey_id not in HOTKEY_IDS:
+            return False
+        normalised = _normalise_hotkey(value)
+        if normalised is None:
+            return False
+        settings["hotkeys"][hotkey_id] = normalised
+    else:
+        return False
+
+    try:
+        _write_settings(settings)
+    except OSError as error:
+        log(f"Error updating settings: {type(error).__name__}")
+        return False
+    return True
+
+
+def reset_settings():
+    try:
+        bindings_path = _bindings_file()
+        bindings_content = _read_owned_text(bindings_path) or ""
+        if HOTKEY_MARKER_START in bindings_content and HOTKEY_MARKER_END in bindings_content:
+            return apply_hotkeys(copy.deepcopy(DEFAULT_SETTINGS["hotkeys"]))
+        _write_settings(DEFAULT_SETTINGS)
+    except OSError as error:
+        log(f"Error resetting settings: {type(error).__name__}")
+        return False
+    return True
+
+
+def list_audio_sources():
+    sources = [{"id": "default", "name": "System default"}]
+    try:
+        result = subprocess.run(
+            ["pactl", "-f", "json", "list", "sources"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0:
+            return sources
+        parsed = json.loads(result.stdout or "[]")
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        return sources
+
+    if not isinstance(parsed, list):
+        return sources
+    seen = {"default"}
+    for source in parsed:
+        if not isinstance(source, dict):
+            continue
+        properties = source.get("properties")
+        media_class = properties.get("media.class") if isinstance(properties, dict) else None
+        if media_class and media_class != "Audio/Source":
+            continue
+        name = str(source.get("name") or "").strip()
+        if not name or name in seen or _normalise_audio_source(name) is None:
+            continue
+        seen.add(name)
+        description = str(source.get("description") or name).strip()
+        sources.append({"id": name, "name": description})
+    return sources
+
+
+def _settings_hotkeys(overrides=None):
+    settings = get_settings()
+    hotkeys = dict(settings["hotkeys"])
+    if overrides is not None:
+        if not isinstance(overrides, dict):
+            return None
+        for hotkey_id in HOTKEY_IDS:
+            if hotkey_id not in overrides:
+                continue
+            normalised = _normalise_hotkey(overrides[hotkey_id])
+            if normalised is None:
+                return None
+            hotkeys[hotkey_id] = normalised
+
+    assigned = [value for value in hotkeys.values() if value]
+    if len(assigned) != len(set(assigned)):
+        return None
+    return hotkeys
+
+
+def _bindings_file():
+    return os.path.join(XDG_CONFIG_HOME, "hypr", "bindings.lua")
+
+
+def _hotkey_modmask(shortcut):
+    parts = [part.strip() for part in shortcut.split("+")]
+    if not parts:
+        return None, None
+    mask = 0
+    for modifier in parts[:-1]:
+        if modifier not in HOTKEY_MODMASKS:
+            return None, None
+        mask |= HOTKEY_MODMASKS[modifier]
+    return mask, parts[-1]
+
+
+def _hotkey_conflicts(hotkeys):
+    try:
+        result = subprocess.run(
+            ["hyprctl", "-j", "binds"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0:
+            return []
+        bindings = json.loads(result.stdout or "[]")
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        return []
+
+    conflicts = []
+    for hotkey_id, shortcut in hotkeys.items():
+        if not shortcut:
+            continue
+        mask, key = _hotkey_modmask(shortcut)
+        if mask is None:
+            continue
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            if binding.get("modmask") != mask or str(binding.get("key", "")).upper() != key:
+                continue
+            description = str(binding.get("description") or "Unlabelled binding")
+            if description.startswith("Flow:"):
+                continue
+            conflicts.append(
+                {
+                    "action": hotkey_id,
+                    "shortcut": shortcut,
+                    "description": description,
+                    "release": binding.get("release") is True,
+                }
+            )
+    return conflicts
+
+
+def hotkeys_status():
+    settings = get_settings()
+    bindings_path = _bindings_file()
+    content = _read_owned_text(bindings_path) or ""
+    return {
+        "installed": HOTKEY_MARKER_START in content and HOTKEY_MARKER_END in content,
+        "hotkeys": settings["hotkeys"],
+        "conflicts": _hotkey_conflicts(settings["hotkeys"]),
+    }
+
+
+def _lua_string(value):
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _hotkey_block(hotkeys):
+    commands = {
+        "toggle": ("Flow: Toggle dictation", "toggle"),
+        "toggle_submit": ("Flow: Dictate & submit", "toggleSubmit"),
+        "pause": ("Flow: Pause / resume", "pause"),
+        "cancel": ("Flow: Cancel recording", "cancel"),
+    }
+    lines = [
+        HOTKEY_MARKER_START,
+        "-- Managed by Omarchy Flow. Configure these in the Flow settings menu.",
+    ]
+    for hotkey_id in HOTKEY_IDS:
+        shortcut = hotkeys.get(hotkey_id, "")
+        if not shortcut:
+            continue
+        lines.append(f"hl.unbind({_lua_string(shortcut)})")
+        if hotkey_id == "push_to_talk":
+            lines.append(
+                f'o.bind({_lua_string(shortcut)}, "Flow: Push to talk", '
+                '"quickshell ipc call io.github.ef-code.omarchy-flow.service start")'
+            )
+            lines.append(
+                f'o.bind({_lua_string(shortcut)}, "Flow: Push to talk (release)", '
+                '"quickshell ipc call io.github.ef-code.omarchy-flow.service stop", '
+                "{ release = true })"
+            )
+            continue
+        description, action = commands[hotkey_id]
+        lines.append(
+            f'o.bind({_lua_string(shortcut)}, {_lua_string(description)}, '
+            f'"quickshell ipc call io.github.ef-code.omarchy-flow.service {action}")'
+        )
+    lines.append(HOTKEY_MARKER_END)
+    return "\n".join(lines)
+
+
+def _without_hotkey_block(content):
+    pattern = re.compile(
+        rf"(?ms)^{re.escape(HOTKEY_MARKER_START)}\n.*?^{re.escape(HOTKEY_MARKER_END)}\n?"
+    )
+    return pattern.sub("", content)
+
+
+def _restore_bindings(path, previous):
+    try:
+        if previous is None:
+            _remove_owned_path(path)
+        else:
+            _write_private_text(path, previous)
+        subprocess.run(["hyprctl", "reload"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def apply_hotkeys(overrides=None):
+    hotkeys = _settings_hotkeys(overrides)
+    if hotkeys is None:
+        return False
+
+    bindings_path = _bindings_file()
+    bindings_parent = os.path.dirname(bindings_path)
+    if os.path.islink(bindings_parent):
+        return False
+    try:
+        os.makedirs(bindings_parent, mode=0o700, exist_ok=True)
+    except OSError:
+        return False
+
+    previous = _read_owned_text(bindings_path)
+    if previous is None and os.path.lexists(bindings_path):
+        return False
+    base = previous or "-- Omarchy Flow managed bindings\n"
+    new_content = _without_hotkey_block(base).rstrip() + "\n\n" + _hotkey_block(hotkeys) + "\n"
+    old_settings = get_settings()
+
+    try:
+        candidate_settings = copy.deepcopy(old_settings)
+        candidate_settings["hotkeys"] = hotkeys
+        _write_settings(candidate_settings)
+        _write_private_text(bindings_path, new_content)
+        reload_result = subprocess.run(
+            ["hyprctl", "reload"], capture_output=True, text=True, timeout=5
+        )
+        if reload_result.returncode != 0:
+            raise RuntimeError("hyprctl reload failed")
+        errors_result = subprocess.run(
+            ["hyprctl", "configerrors"], capture_output=True, text=True, timeout=5
+        )
+        if errors_result.returncode != 0 or (errors_result.stdout + errors_result.stderr).strip():
+            raise RuntimeError("Hyprland reported configuration errors")
+    except (OSError, subprocess.SubprocessError, RuntimeError):
+        _restore_bindings(bindings_path, previous)
+        try:
+            _write_settings(old_settings)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def run_audio_test():
+    if not shutil.which("ffmpeg"):
+        return {"ok": False, "message": "ffmpeg is not installed"}
+    try:
+        _ensure_private_dir(RUNTIME_DIR)
+        fd, target = tempfile.mkstemp(prefix=".audio-test-", suffix=".wav", dir=RUNTIME_DIR)
+        os.close(fd)
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error", "-f", "pulse",
+                "-i", get_settings()["audio_source"], "-t", "0.5", "-ar", "16000",
+                "-ac", "1", target,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        size = os.path.getsize(target) if os.path.exists(target) else 0
+        ok = result.returncode == 0 and size >= 1000
+        return {"ok": ok, "message": "Microphone capture works" if ok else "Microphone capture failed"}
+    except (OSError, subprocess.SubprocessError):
+        return {"ok": False, "message": "Microphone capture failed"}
+    finally:
+        if "target" in locals():
+            _remove_owned_path(target)
+
+
+def diagnostics():
+    settings = get_settings()
+    selected_model = get_selected_model()
+    checks = []
+
+    def add_tool(tool, label, required):
+        path = shutil.which(tool)
+        checks.append({
+            "id": tool,
+            "label": label,
+            "ok": bool(path),
+            "detail": "Ready" if path else "Not found",
+            "required": required,
+        })
+
+    add_tool("ffmpeg", "Audio recorder", True)
+    add_tool("wtype", "Text insertion", True)
+    add_tool("wl-copy", "Clipboard integration", False)
+    if selected_model == "whisper-base.en":
+        add_tool("voxtype", "Local Whisper", True)
+    else:
+        key_ready = bool(get_gemini_api_key())
+        checks.append({
+            "id": "gemini-api-key",
+            "label": "Gemini API key",
+            "ok": key_ready,
+            "detail": "Configured" if key_ready else "Not configured",
+            "required": True,
+        })
+
+    source_ids = {source["id"] for source in list_audio_sources()}
+    source_ready = settings["audio_source"] == "default" or settings["audio_source"] in source_ids
+    checks.append({
+        "id": "audio-source",
+        "label": "Audio input",
+        "ok": source_ready,
+        "detail": "System default" if settings["audio_source"] == "default" else settings["audio_source"],
+        "required": True,
+    })
+    return {"ok": all(check["ok"] for check in checks if check["required"]), "checks": checks}
 
 def log(msg):
     fd = None
@@ -414,7 +900,7 @@ def _is_recorder_process(pid):
     try:
         format_index = args.index("-f")
         input_index = args.index("-i")
-        if args[format_index + 1] != "pulse" or args[input_index + 1] != "default":
+        if args[format_index + 1] != "pulse" or not args[input_index + 1]:
             return False
     except (ValueError, IndexError):
         return False
@@ -599,7 +1085,7 @@ def _start_recording():
         proc = subprocess.Popen(
             [
                 "ffmpeg", "-y", "-loglevel", "error",
-                "-f", "pulse", "-i", "default",
+                "-f", "pulse", "-i", get_settings()["audio_source"],
                 "-ar", "16000", "-ac", "1",
                 TEMP_AUDIO,
             ],
@@ -865,15 +1351,18 @@ def _transcribe_audio(target_audio, model_choice):
 
 def _inject_text(text, auto_submit=False):
     clipboard_ok = False
-    try:
-        result = subprocess.run(
-            ["wl-copy", "--sensitive"], input=text, text=True, check=False, timeout=5
-        )
-        clipboard_ok = result.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        pass
+    copy_to_clipboard = get_settings()["copy_to_clipboard"]
+    if copy_to_clipboard:
+        try:
+            result = subprocess.run(
+                ["wl-copy", "--sensitive"], input=text, text=True, check=False, timeout=5
+            )
+            clipboard_ok = result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            pass
     if not clipboard_ok:
-        log("Clipboard copy failed; continuing with keyboard injection")
+        if copy_to_clipboard:
+            log("Clipboard copy failed; continuing with keyboard injection")
 
     try:
         typed = subprocess.run(["wtype", "--", text], check=False, timeout=5)
@@ -953,18 +1442,20 @@ def stop_recording(auto_submit=False):
         return _stop_recording(auto_submit=auto_submit)
 
 
-def toggle_recording(auto_submit=False):
+def toggle_recording(auto_submit=None):
     with _operation_lock() as locked:
         if not locked:
             return False
         pids = _active_recording_pids()
         if pids:
+            if auto_submit is None:
+                auto_submit = get_settings()["toggle_action"] == "submit"
             return _stop_recording(auto_submit=auto_submit, pids=pids)
         return _start_recording()
 
 
 def _usage():
-    return "Usage: gemini-dictate.py [start|stop|submit|pause|resume|cancel|toggle|toggle-submit|status|get-model|set-model <id>|list-models]"
+    return "Usage: gemini-dictate.py [start|stop|submit|pause|resume|cancel|toggle|toggle-submit|status|get-model|set-model <id>|list-models|settings]"
 
 
 if __name__ == "__main__":
@@ -983,7 +1474,7 @@ if __name__ == "__main__":
     elif action == "cancel":
         success = cancel_recording()
     elif action == "toggle":
-        success = toggle_recording(auto_submit=False)
+        success = toggle_recording()
     elif action == "toggle-submit":
         success = toggle_recording(auto_submit=True)
     elif action == "status":
@@ -1001,6 +1492,53 @@ if __name__ == "__main__":
             sys.exit(1)
         print(get_selected_model())
         success = True
+    elif action in ("settings", "get-settings"):
+        print(json.dumps(get_settings(), separators=(",", ":")))
+        success = True
+    elif action == "set-setting":
+        if len(sys.argv) != 4:
+            print("Error: setting key and value required", file=sys.stderr)
+            sys.exit(1)
+        if not set_setting(sys.argv[2], sys.argv[3]):
+            print(f"Error: invalid setting: {sys.argv[2]}", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(get_settings(), separators=(",", ":")))
+        success = True
+    elif action == "reset-settings":
+        if not reset_settings():
+            print("Error: could not reset settings", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(get_settings(), separators=(",", ":")))
+        success = True
+    elif action == "list-audio-sources":
+        print(json.dumps(list_audio_sources(), separators=(",", ":")))
+        success = True
+    elif action == "hotkeys-status":
+        print(json.dumps(hotkeys_status(), separators=(",", ":")))
+        success = True
+    elif action == "apply-hotkeys":
+        overrides = None
+        if len(sys.argv) > 2:
+            if len(sys.argv) != 3:
+                print("Error: apply-hotkeys accepts one JSON object", file=sys.stderr)
+                sys.exit(1)
+            try:
+                overrides = json.loads(sys.argv[2])
+            except (TypeError, ValueError):
+                print("Error: invalid hotkey JSON", file=sys.stderr)
+                sys.exit(1)
+        if not apply_hotkeys(overrides):
+            print("Error: could not apply Flow hotkeys", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(hotkeys_status(), separators=(",", ":")))
+        success = True
+    elif action == "doctor":
+        print(json.dumps(diagnostics(), separators=(",", ":")))
+        success = True
+    elif action == "test-audio":
+        result = run_audio_test()
+        print(json.dumps(result, separators=(",", ":")))
+        success = result["ok"] is True
     elif action == "list-models":
         print(json.dumps(SUPPORTED_MODELS, indent=2))
         success = True
