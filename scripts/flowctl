@@ -30,7 +30,7 @@ fi
 ACTION="${1:-toggle}"
 
 case "$ACTION" in
-  toggle|toggle-submit|start|stop|done|transcribe|submit|send|pause|toggle-pause|resume|cancel|status|list-models)
+  toggle|toggle-submit|start|stop|done|transcribe|submit|send|pause|toggle-pause|resume|cancel|status|list-models|settings|get-settings|reset-settings|list-audio-sources|hotkeys-status|doctor|test-audio)
     if [[ $# -gt 1 ]]; then
       echo "Error: '$ACTION' does not accept arguments." >&2
       exit 1
@@ -65,6 +65,27 @@ case "$ACTION" in
     fi
     exec "$PYTHON_BIN" "$BACKEND_PY" "$ACTION" "$2"
     ;;
+  set-setting)
+    if [[ $# -ne 3 ]]; then
+      echo "Error: set-setting requires a key and value." >&2
+      exit 1
+    fi
+    exec "$PYTHON_BIN" "$BACKEND_PY" "$ACTION" "$2" "$3"
+    ;;
+  apply-hotkeys)
+    case $# in
+      1)
+        exec "$PYTHON_BIN" "$BACKEND_PY" "$ACTION"
+        ;;
+      2)
+        exec "$PYTHON_BIN" "$BACKEND_PY" "$ACTION" "$2"
+        ;;
+      *)
+        echo "Error: apply-hotkeys accepts zero or one JSON object." >&2
+        exit 1
+        ;;
+    esac
+    ;;
   help|--help|-h)
     echo "Omarchy Flow — Speech Dictation & AI Assistant"
     echo "Usage: flowctl [command] [args...]"
@@ -79,9 +100,17 @@ case "$ACTION" in
     echo "  resume           Resume recording if paused"
     echo "  cancel           Discard current recording without transcribing"
     echo "  status           Output recording state (JSON)"
-    echo "  model [id]       Get or set current speech-to-text model"
-    echo "  list-models      List all supported speech models"
-    echo "  help             Show this help message"
+  echo "  model [id]       Get or set current speech-to-text model"
+  echo "  list-models      List all supported speech models"
+  echo "  settings         Output persisted Flow preferences as JSON"
+  echo "  set-setting      Update one preference"
+  echo "  apply-hotkeys    Install configured shortcuts into Hyprland"
+  echo "  hotkeys-status   Show shortcut installation and conflicts"
+  echo "  list-audio-sources  List available microphone inputs"
+  echo "  doctor           Check Flow dependencies and configuration"
+  echo "  test-audio       Capture a short microphone test"
+  echo "  reset-settings   Restore Flow preferences to defaults"
+  echo "  help             Show this help message"
     ;;
   *)
     echo "Unknown command: $ACTION" >&2
