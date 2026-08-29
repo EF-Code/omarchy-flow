@@ -42,7 +42,7 @@ echo "Manifest OK."
 echo ""
 echo "=== 2. Linting QML Components (qmllint) ==="
 OMARCHY_SHELL_PATH="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
-qmllint -I "$OMARCHY_SHELL_PATH" BarWidget.qml Pill.qml Service.qml
+qmllint -I "$OMARCHY_SHELL_PATH" BarWidget.qml SettingsView.qml FlowDropdown.qml Pill.qml Service.qml
 echo "QML Lint OK."
 
 echo ""
