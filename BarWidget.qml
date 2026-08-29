@@ -79,7 +79,8 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.isRecording ? (root.isPaused ? "󰏤" : "󰍬") : "󰍭"
+    text: ""
+    iconComponent: flowIcon
     active: root.isRecording
     useActiveColor: true
     activeColor: root.isPaused ? "#FBBF24" : Color.accent
@@ -102,4 +103,117 @@ BarWidget {
   }
 
   Component.onCompleted: Qt.callLater(root.refreshStatus)
+
+  Component {
+    id: flowIcon
+
+    Item {
+      id: flowIconRoot
+      anchors.fill: parent
+
+      property color barColor: button.foreground
+
+      Behavior on barColor {
+        ColorAnimation { duration: 160 }
+      }
+
+      opacity: root.isPaused ? 0.55 : 1.0
+
+      Behavior on opacity {
+        NumberAnimation { duration: 160 }
+      }
+
+      Row {
+        id: flowMark
+        anchors.centerIn: parent
+        spacing: 1.5
+
+        // Match the five waveform bars in Pill.qml without imposing a palette.
+        Rectangle {
+          width: 2
+          radius: 1
+          anchors.verticalCenter: parent.verticalCenter
+          property real animatedHeight: 8
+          height: root.isRecording && !root.isPaused ? animatedHeight : 8
+          color: flowIconRoot.barColor
+
+          SequentialAnimation on animatedHeight {
+            running: root.isRecording && !root.isPaused
+            loops: Animation.Infinite
+            NumberAnimation { to: 11; duration: 280; easing.type: Easing.InOutSine }
+            NumberAnimation { to: 5; duration: 240; easing.type: Easing.InOutSine }
+            NumberAnimation { to: 8; duration: 220; easing.type: Easing.InOutSine }
+          }
+        }
+
+        Rectangle {
+          width: 2
+          radius: 1
+          anchors.verticalCenter: parent.verticalCenter
+          property real animatedHeight: 10
+          height: root.isRecording && !root.isPaused ? animatedHeight : 10
+          color: flowIconRoot.barColor
+
+          SequentialAnimation on animatedHeight {
+            running: root.isRecording && !root.isPaused
+            loops: Animation.Infinite
+            NumberAnimation { to: 6; duration: 240; easing.type: Easing.InOutSine }
+            NumberAnimation { to: 14; duration: 300; easing.type: Easing.InOutSine }
+            NumberAnimation { to: 9; duration: 260; easing.type: Easing.InOutSine }
+          }
+        }
+
+        Rectangle {
+          width: 2
+          radius: 1
+          anchors.verticalCenter: parent.verticalCenter
+          property real animatedHeight: 12
+          height: root.isRecording && !root.isPaused ? animatedHeight : 12
+          color: flowIconRoot.barColor
+
+          SequentialAnimation on animatedHeight {
+            running: root.isRecording && !root.isPaused
+            loops: Animation.Infinite
+            NumberAnimation { to: 14; duration: 260; easing.type: Easing.InOutSine }
+            NumberAnimation { to: 5; duration: 280; easing.type: Easing.InOutSine }
+            NumberAnimation { to: 11; duration: 220; easing.type: Easing.InOutSine }
+          }
+        }
+
+        Rectangle {
+          width: 2
+          radius: 1
+          anchors.verticalCenter: parent.verticalCenter
+          property real animatedHeight: 13
+          height: root.isRecording && !root.isPaused ? animatedHeight : 13
+          color: flowIconRoot.barColor
+
+          SequentialAnimation on animatedHeight {
+            running: root.isRecording && !root.isPaused
+            loops: Animation.Infinite
+            NumberAnimation { to: 5; duration: 330; easing.type: Easing.InOutSine }
+            NumberAnimation { to: 14; duration: 250; easing.type: Easing.InOutSine }
+            NumberAnimation { to: 9; duration: 300; easing.type: Easing.InOutSine }
+          }
+        }
+
+        Rectangle {
+          width: 2
+          radius: 1
+          anchors.verticalCenter: parent.verticalCenter
+          property real animatedHeight: 9
+          height: root.isRecording && !root.isPaused ? animatedHeight : 9
+          color: flowIconRoot.barColor
+
+          SequentialAnimation on animatedHeight {
+            running: root.isRecording && !root.isPaused
+            loops: Animation.Infinite
+            NumberAnimation { to: 13; duration: 270; easing.type: Easing.InOutSine }
+            NumberAnimation { to: 5; duration: 310; easing.type: Easing.InOutSine }
+            NumberAnimation { to: 10; duration: 260; easing.type: Easing.InOutSine }
+          }
+        }
+      }
+    }
+  }
 }
