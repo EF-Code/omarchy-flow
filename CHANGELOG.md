@@ -5,6 +5,19 @@ All notable changes to **Omarchy Flow** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Expanded the bar menu into a settings hub for dictation behavior, audio
+  input, privacy, HUD appearance, diagnostics, and project information.
+- Added persistent preferences for toggle completion, clipboard copying,
+  audio source, HUD position, and waveform visibility.
+- Added editable Hyprland shortcut setup with conflict visibility, managed
+  block installation, automatic reload, and rollback on configuration errors.
+
+### Fixed
+- Made settings dropdowns close reliably when the open trigger is tapped again.
+
 ## [0.3.0] - 2026-08-29
 
 ### Fixed
