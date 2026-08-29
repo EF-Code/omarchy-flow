@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Omarchy Flow — Command-Line & Desktop Hotkey Dispatcher
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+BACKEND_PY="$SCRIPT_DIR/gemini-dictate.py"
+
+# Prefer an explicit override, then the active environment and common local
+# virtualenv locations. The override makes tests and packaged installations
+# deterministic without embedding a developer-specific home directory.
+if [[ -n "${OMARCHY_FLOW_PYTHON:-}" ]]; then
+  if [[ ! -x "$OMARCHY_FLOW_PYTHON" ]]; then
+    echo "Error: OMARCHY_FLOW_PYTHON is not executable: $OMARCHY_FLOW_PYTHON" >&2
+    exit 1
+  fi
+  PYTHON_BIN="$OMARCHY_FLOW_PYTHON"
+elif [[ -n "${VIRTUAL_ENV:-}" && -x "$VIRTUAL_ENV/bin/python" ]]; then
+  PYTHON_BIN="$VIRTUAL_ENV/bin/python"
+elif [[ -x "$HOME/.venv/bin/python" ]]; then
+  PYTHON_BIN="$HOME/.venv/bin/python"
+elif [[ -x "$HOME/.local/share/venvs/default/bin/python" ]]; then
+  PYTHON_BIN="$HOME/.local/share/venvs/default/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+else
+  echo "Error: Python 3 not found on system PATH." >&2
+  exit 1
+fi
+
+ACTION="${1:-toggle}"
+
+case "$ACTION" in
+  toggle|toggle-submit|start|stop|done|transcribe|submit|send|pause|toggle-pause|resume|cancel|status|list-models)
+    if [[ $# -gt 1 ]]; then
+      echo "Error: '$ACTION' does not accept arguments." >&2
+      exit 1
+    fi
+    exec "$PYTHON_BIN" "$BACKEND_PY" "$ACTION"
+    ;;
+  model)
+    case $# in
+      1)
+        exec "$PYTHON_BIN" "$BACKEND_PY" "get-model"
+        ;;
+      2)
+        exec "$PYTHON_BIN" "$BACKEND_PY" "set-model" "$2"
+        ;;
+      *)
+        echo "Error: model accepts zero or one model id." >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  get-model)
+    if [[ $# -ne 1 ]]; then
+      echo "Error: get-model does not accept arguments." >&2
+      exit 1
+    fi
+    exec "$PYTHON_BIN" "$BACKEND_PY" "$ACTION"
+    ;;
+  set-model)
+    if [[ $# -ne 2 ]]; then
+      echo "Error: set-model requires exactly one model id." >&2
+      exit 1
+    fi
+    exec "$PYTHON_BIN" "$BACKEND_PY" "$ACTION" "$2"
+    ;;
+  help|--help|-h)
+    echo "Omarchy Flow — Speech Dictation & AI Assistant"
+    echo "Usage: flowctl [command] [args...]"
+    echo ""
+    echo "Commands:"
+    echo "  toggle           Toggle voice dictation recording (transcribes on stop)"
+    echo "  toggle-submit    Toggle voice dictation and press Return on stop"
+    echo "  start            Start voice recording immediately"
+    echo "  stop             Stop voice recording and inject transcribed text"
+    echo "  submit           Stop voice recording, inject text, and press Return"
+    echo "  pause            Toggle pause / resume during active recording"
+    echo "  resume           Resume recording if paused"
+    echo "  cancel           Discard current recording without transcribing"
+    echo "  status           Output recording state (JSON)"
+    echo "  model [id]       Get or set current speech-to-text model"
+    echo "  list-models      List all supported speech models"
+    echo "  help             Show this help message"
+    ;;
+  *)
+    echo "Unknown command: $ACTION" >&2
+    echo "Run 'flowctl help' for usage instructions." >&2
+    exit 1
+    ;;
+esac
