@@ -11,6 +11,9 @@ Item {
     property string statusText: ""
     property bool dropdownOpen: false
     property string selectedModel: "whisper-base.en"
+    property bool hudEnabled: true
+    property string hudPosition: "bottom"
+    property bool waveformEnabled: true
 
     readonly property string flowctlPath: decodeURIComponent(String(Qt.resolvedUrl("scripts/flowctl")).replace(/^file:\/\//, ""))
 
@@ -44,6 +47,25 @@ Item {
             command = [root.flowctlPath, "model", modelId]
             running = true
             return "ok"
+        }
+    }
+
+    Process {
+        id: loadSettingsProcess
+        command: [root.flowctlPath, "settings"]
+        running: true
+        stdout: StdioCollector {
+            id: settingsOutput
+            waitForEnd: true
+        }
+        onExited: function(exitCode) {
+            if (exitCode !== 0 || !settingsOutput.text) return
+            try {
+                var settings = JSON.parse(settingsOutput.text.trim())
+                if (settings.hud_enabled !== undefined) root.hudEnabled = settings.hud_enabled === true
+                if (settings.hud_position === "top" || settings.hud_position === "bottom") root.hudPosition = settings.hud_position
+                if (settings.waveform_enabled !== undefined) root.waveformEnabled = settings.waveform_enabled === true
+            } catch (e) {}
         }
     }
 
@@ -143,6 +165,13 @@ Item {
         }
     }
 
+    Timer {
+        interval: 3000
+        repeat: true
+        running: true
+        onTriggered: if (!loadSettingsProcess.running) loadSettingsProcess.running = true
+    }
+
     // Process runners for button clicks and actions
     Process {
         id: pauseProcess
@@ -163,9 +192,15 @@ Item {
 
     PanelWindow {
         id: panel
-        visible: root.isVisible || card.opacity > 0
-        anchors { bottom: true }
-        margins { bottom: 110 }
+        visible: root.hudEnabled && (root.isVisible || card.opacity > 0)
+        anchors {
+            top: root.hudPosition === "top"
+            bottom: root.hudPosition === "bottom"
+        }
+        margins {
+            top: root.hudPosition === "top" ? 60 : 0
+            bottom: root.hudPosition === "bottom" ? 110 : 0
+        }
         implicitWidth: Math.max(card.width, (dropdownMenu.visible ? dropdownMenu.width : 0))
         implicitHeight: card.height + (dropdownMenu.visible ? (dropdownMenu.height + 10) : 0)
         color: "transparent"
@@ -310,6 +345,7 @@ Item {
                     // 1. Google 5-Color Waveform Equalizer (High Luminance Vibrant Bars)
                     Row {
                         id: barsRow
+                        visible: root.waveformEnabled
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: 2.5
 
