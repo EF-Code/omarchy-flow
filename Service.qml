@@ -6,12 +6,23 @@ Item {
   id: root
 
   readonly property string flowctlPath: decodeURIComponent(String(Qt.resolvedUrl("scripts/flowctl")).replace(/^file:\/\//, ""))
+  property var actionQueue: []
+
+  function runNextAction() {
+    if (actionProcess.running || root.actionQueue.length === 0) return
+    actionProcess.command = root.actionQueue.shift()
+    actionProcess.running = true
+  }
 
   function runAction(action, extraArg) {
-    if (actionProcess.running) return "busy"
     var cmd = [root.flowctlPath, action]
     if (extraArg !== undefined && extraArg !== null && String(extraArg).trim() !== "") {
       cmd.push(String(extraArg))
+    }
+    if (actionProcess.running || root.actionQueue.length > 0) {
+      if (root.actionQueue.length >= 8) return "busy"
+      root.actionQueue.push(cmd)
+      return "queued"
     }
     actionProcess.command = cmd
     actionProcess.running = true
@@ -21,6 +32,9 @@ Item {
   Process {
     id: actionProcess
     command: []
+    onRunningChanged: {
+      if (!running) Qt.callLater(root.runNextAction)
+    }
   }
 
   IpcHandler {
