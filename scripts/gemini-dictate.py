@@ -664,8 +664,36 @@ def diagnostics():
     add_tool("ffmpeg", "Audio recorder", True)
     add_tool("wtype", "Text insertion", True)
     add_tool("wl-copy", "Clipboard integration", False)
-    if selected_model == "whisper-base.en":
+    if selected_model == LOCAL_MODEL_ID:
         add_tool("voxtype", "Local Whisper", True)
+        model_ready = False
+        model_detail = f"Run voxtype setup model and install {LOCAL_VOXTYPE_MODEL}"
+        if shutil.which("voxtype"):
+            try:
+                result = subprocess.run(
+                    ["voxtype", "setup", "model", "--list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                installed_models = result.stdout if result.returncode == 0 else ""
+                model_ready = bool(
+                    re.search(
+                        rf"(?m)^\s*{re.escape(LOCAL_VOXTYPE_MODEL)}(?:\s|\()",
+                        installed_models,
+                    )
+                )
+                if model_ready:
+                    model_detail = f"{LOCAL_VOXTYPE_MODEL} installed"
+            except (OSError, subprocess.SubprocessError):
+                pass
+        checks.append({
+            "id": "voxtype-model",
+            "label": "Local model",
+            "ok": model_ready,
+            "detail": model_detail,
+            "required": True,
+        })
     else:
         try:
             sdk_ready = importlib.util.find_spec("google.genai") is not None
