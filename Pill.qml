@@ -247,9 +247,9 @@ Item {
 
                     Repeater {
                         model: [
-                            { id: "whisper-base.en", title: "Whisper base.en", subtitle: "Local • Zero Latency" },
-                            { id: "gemini-3.5-transcribe", title: "Gemini 3.5 Transcribe", subtitle: "Dedicated Audio • Ultra Fast" },
-                            { id: "gemini-3.7-flash", title: "Gemini 3.7 Flash", subtitle: "Flagship • Reasoning" }
+                            { id: "whisper-base.en", title: "Local Whisper", subtitle: "base.en • Offline" },
+                            { id: "gemini-3.5-transcribe", title: "Gemini 3.5 Transcribe", subtitle: "Cloud • Dedicated transcription" },
+                            { id: "gemini-3.7-flash", title: "Gemini 3.7 Flash", subtitle: "Cloud • Speech transcription" }
                         ]
 
                         Rectangle {

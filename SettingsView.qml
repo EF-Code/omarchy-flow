@@ -38,7 +38,7 @@ Item {
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
 
   readonly property var modelOptions: [
-    { value: "whisper-base.en", label: "Whisper base.en" },
+    { value: "whisper-base.en", label: "Local Whisper (base.en)" },
     { value: "gemini-3.5-transcribe", label: "Gemini 3.5 Transcribe" },
     { value: "gemini-3.7-flash", label: "Gemini 3.7 Flash" }
   ]
