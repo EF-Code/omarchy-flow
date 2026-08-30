@@ -1161,7 +1161,7 @@ Item {
           spacing: Style.space(3)
 
           Text {
-            text: "Omarchy Flow 0.3.0"
+            text: "Omarchy Flow 0.4.0"
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.subtitle

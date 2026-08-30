@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.ef-code.omarchy-flow",
   "name": "Omarchy Flow",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "EF-Code",
   "license": "MIT",
-  "description": "Voice dictation HUD pill and AI speech-to-text integration for Omarchy.",
+  "description": "Voice dictation with local Whisper and Google Gemini transcription for Omarchy.",
   "kinds": [
     "service",
     "overlay",
