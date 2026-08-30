@@ -21,6 +21,7 @@ import datetime
 import tempfile
 import warnings
 import shutil
+import importlib.util
 
 # Dynamically discover and include virtual environment site-packages (e.g. ~/.venv)
 def _ensure_venv_packages():
@@ -663,6 +664,17 @@ def diagnostics():
     if selected_model == "whisper-base.en":
         add_tool("voxtype", "Local Whisper", True)
     else:
+        try:
+            sdk_ready = importlib.util.find_spec("google.genai") is not None
+        except (ImportError, ModuleNotFoundError, ValueError):
+            sdk_ready = False
+        checks.append({
+            "id": "google-genai",
+            "label": "Google Gen AI SDK",
+            "ok": sdk_ready,
+            "detail": "Ready" if sdk_ready else "Not found",
+            "required": True,
+        })
         key_ready = bool(get_gemini_api_key())
         checks.append({
             "id": "gemini-api-key",
