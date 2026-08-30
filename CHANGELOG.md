@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Made settings dropdowns close reliably when the open trigger is tapped again.
+- Corrected the recording menu's Transcribe action so it no longer presses
+  Return, and preserved temporary HUD error/status messages.
+- Queued overlapping service actions so quick push-to-talk releases are not
+  dropped while recording is starting.
+- Queued rapid settings writes, added cloud SDK readiness diagnostics, and
+  hardened legacy runtime compatibility against shared `/tmp` interference.
+- Created recording files with owner-only permissions before exposing the
+  optional legacy hard-link compatibility path.
+- Routed managed Hyprland shortcuts through `omarchy-shell` so they target the
+  running Omarchy Quickshell instance instead of an absent default config.
 
 ## [0.3.0] - 2026-08-29
 
