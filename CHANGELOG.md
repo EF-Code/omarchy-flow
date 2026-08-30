@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-30
+
 ### Added
 - Expanded the bar menu into a settings hub for dictation behavior, audio
   input, privacy, HUD appearance, diagnostics, and project information.
@@ -16,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   block installation, automatic reload, and rollback on configuration errors.
 
 ### Fixed
+- Made Reset Flow preferences restore behavior, audio, HUD, and shortcuts even
+  when managed shortcuts are installed.
+- Added safe managed-shortcut removal so uninstalling Flow does not leave dead
+  Hyprland bindings behind.
+- Automatically migrated existing Flow-managed shortcut blocks to the current
+  Omarchy shell IPC commands without installing shortcuts for new users.
+- Made the local selector consistently use Voxtype's `base.en` model, verified
+  that the model is installed in diagnostics, and allowed slower local
+  transcriptions more time to finish.
+- Clarified the supported provider boundary and local/Gemini setup, and removed
+  obsolete manual Hyprland INI shortcut instructions from the README.
 - Made settings dropdowns close reliably when the open trigger is tapped again.
 - Corrected the recording menu's Transcribe action so it no longer presses
   Return, and preserved temporary HUD error/status messages.
