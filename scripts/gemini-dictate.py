@@ -106,10 +106,13 @@ LEGACY_TEMP_AUDIO = os.path.join(LEGACY_RUNTIME_DIR, "gemini_dictation.wav")
 LEGACY_PID_FILE = os.path.join(LEGACY_RUNTIME_DIR, "gemini_dictation.pid")
 LEGACY_STATE_FILE = os.path.join(LEGACY_RUNTIME_DIR, "gemini_dictation.state")
 
+LOCAL_MODEL_ID = "whisper-base.en"
+LOCAL_VOXTYPE_MODEL = "base.en"
+
 SUPPORTED_MODELS = [
-    {"id": "whisper-base.en", "name": "Whisper base.en", "desc": "Local • Zero Latency", "provider": "local"},
-    {"id": "gemini-3.5-transcribe", "name": "Gemini 3.5 Transcribe", "desc": "Dedicated Audio • Ultra Fast", "provider": "gemini"},
-    {"id": "gemini-3.7-flash", "name": "Gemini 3.7 Flash", "desc": "Flagship • Reasoning", "provider": "gemini"},
+    {"id": LOCAL_MODEL_ID, "name": "Local Whisper (base.en)", "desc": "Local • Offline", "provider": "local"},
+    {"id": "gemini-3.5-transcribe", "name": "Gemini 3.5 Transcribe", "desc": "Cloud • Dedicated transcription", "provider": "gemini"},
+    {"id": "gemini-3.7-flash", "name": "Gemini 3.7 Flash", "desc": "Cloud • Speech transcription", "provider": "gemini"},
 ]
 
 DEFAULT_MODEL_ID = SUPPORTED_MODELS[0]["id"]
@@ -1291,10 +1294,10 @@ class MissingApiKeyError(RuntimeError):
 
 def _transcribe_local(target_audio):
     result = subprocess.run(
-        ["voxtype", "transcribe", target_audio],
+        ["voxtype", "--model", LOCAL_VOXTYPE_MODEL, "transcribe", target_audio],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=120,
     )
     if result.returncode != 0:
         raise RuntimeError("voxtype returned a non-zero exit code")
@@ -1356,7 +1359,7 @@ def _transcribe_cloud(target_audio, model_choice):
 
 
 def _transcribe_audio(target_audio, model_choice):
-    if model_choice == "whisper-base.en":
+    if model_choice == LOCAL_MODEL_ID:
         return _transcribe_local(target_audio)
     if model_choice in SUPPORTED_MODEL_IDS:
         return _transcribe_cloud(target_audio, model_choice)
