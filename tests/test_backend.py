@@ -203,6 +203,19 @@ class TestFlowBackend(unittest.TestCase):
             {"id": "desk-mic", "name": "Desk microphone"},
         ])
 
+    def test_cloud_diagnostics_require_google_sdk(self):
+        self.assertTrue(backend.set_selected_model("gemini-3.5-transcribe"))
+        with patch.object(backend.shutil, "which", return_value="/usr/bin/tool"), patch.object(
+            backend.importlib.util, "find_spec", return_value=None
+        ), patch.object(backend, "get_gemini_api_key", return_value="configured-key"), patch.object(
+            backend, "list_audio_sources", return_value=[{"id": "default", "name": "System default"}]
+        ):
+            report = backend.diagnostics()
+
+        sdk_check = next(check for check in report["checks"] if check["id"] == "google-genai")
+        self.assertFalse(sdk_check["ok"])
+        self.assertFalse(report["ok"])
+
     def test_toggle_uses_saved_completion_action(self):
         self.assertTrue(backend.set_setting("toggle_action", "submit"))
         with patch.object(backend, "_active_recording_pids", return_value=[12345]), patch.object(
@@ -233,6 +246,13 @@ class TestFlowBackend(unittest.TestCase):
         self.assertIn(backend.HOTKEY_MARKER_START, content)
         self.assertIn('o.bind("SUPER + ALT + F6"', content)
         self.assertIn('o.bind("F7", "Flow: Push to talk (release)"', content)
+        self.assertIn(
+            '"omarchy-shell io.github.ef-code.omarchy-flow.service toggle"', content
+        )
+        self.assertIn(
+            '"omarchy-shell io.github.ef-code.omarchy-flow.service stop"', content
+        )
+        self.assertNotIn("quickshell ipc call", content)
         self.assertNotIn("toggleSubmit", content)
         self.assertEqual(backend.get_settings()["hotkeys"]["toggle_submit"], "")
 
@@ -249,6 +269,21 @@ class TestFlowBackend(unittest.TestCase):
         self.assertTrue(data["paused"])
         self.assertEqual(data["pid"], 12345)
         self.assertEqual(file_mode(backend.STATE_FILE), 0o600)
+
+    def test_legacy_pid_marker_failure_does_not_block_recording_state(self):
+        original_write = backend._write_private_text
+
+        def fail_legacy(path, content):
+            if path == backend.LEGACY_PID_FILE:
+                raise OSError("legacy path unavailable")
+            return original_write(path, content)
+
+        with patch.object(backend, "_write_private_text", side_effect=fail_legacy):
+            backend._write_pid_markers(4242)
+
+        self.assertEqual(Path(backend.PID_FILE).read_text().strip(), "4242")
+        self.assertEqual(file_mode(backend.PID_FILE), 0o600)
+        self.assertFalse(Path(backend.LEGACY_PID_FILE).exists())
 
     def test_api_key_lookup_env(self):
         with patch.dict(os.environ, {"GEMINI_API_KEY": "test_env_key_123456789"}):
@@ -401,6 +436,20 @@ class TestFlowBackend(unittest.TestCase):
         with self.assertRaises(ValueError):
             backend._transcribe_audio("recording.wav", "unsupported-model")
 
+    def test_transcribing_status_does_not_expose_model_name(self):
+        Path(backend.TEMP_AUDIO).write_bytes(b"R" * 1200)
+        with patch.object(backend, "_terminate_recorder", return_value=True), patch.object(
+            backend, "get_selected_model", return_value="gemini-3.5-transcribe"
+        ), patch.object(backend, "_transcribe_audio", return_value="hello"), patch.object(
+            backend, "_inject_text", return_value=True
+        ), patch.object(backend, "pill_ipc") as ipc:
+            self.assertTrue(backend._stop_recording(pids=[4242]))
+
+        ipc.assert_any_call("setTranscribing", "Transcribing...")
+        self.assertFalse(
+            any("gemini-3.5-transcribe" in str(call.args) for call in ipc.call_args_list)
+        )
+
     def test_inject_text_checks_keyboard_commands(self):
         calls = []
 
@@ -446,10 +495,26 @@ class TestFlowBackend(unittest.TestCase):
             command[command.index("-f") : command.index("-f") + 4],
             ["-f", "pulse", "-i", "default"],
         )
+        self.assertEqual(popen.call_args.kwargs["umask"], 0o077)
         self.assertEqual(file_mode(backend.PID_FILE), 0o600)
         data = json.loads(Path(backend.STATE_FILE).read_text())
         self.assertEqual(data["pid"], 4242)
         self.assertEqual(data["start_ticks"], 1234)
+
+    def test_qml_action_and_status_contracts(self):
+        bar = (REPO_ROOT / "BarWidget.qml").read_text()
+        pill = (REPO_ROOT / "Pill.qml").read_text()
+        service = (REPO_ROOT / "Service.qml").read_text()
+        settings = (REPO_ROOT / "SettingsView.qml").read_text()
+
+        transcribe_button = bar[bar.index('text: "Transcribe"') :]
+        self.assertIn('onClicked: root.closeAfterAction("stop")', transcribe_button[:500])
+        self.assertIn('root.stateMode = "status"', pill)
+        self.assertIn('if (root.stateMode === "status") return root.statusText', pill)
+        self.assertIn("property var actionQueue", service)
+        self.assertIn('return "queued"', service)
+        self.assertIn("property var settingWriteQueue", settings)
+        self.assertIn("root.settingWriteQueue.push(command)", settings)
 
 
 if __name__ == "__main__":
