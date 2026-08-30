@@ -25,3 +25,5 @@ venv/
 # Local agent/audit artifacts
 .agents/
 AGENTS.md
+TEST_INFRA.md
+assets/pill_*.png
