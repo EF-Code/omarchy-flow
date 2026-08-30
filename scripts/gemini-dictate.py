@@ -1058,18 +1058,16 @@ def update_runtime_state(status, paused=False, pid=None, start_ticks=None):
         pass
 
 def _write_pid_markers(pid):
-    written = set()
+    # The private XDG marker is authoritative. The predictable legacy /tmp
+    # marker is best-effort so another local user cannot block recording by
+    # pre-creating that compatibility path in a sticky shared directory.
+    _write_private_text(PID_FILE, f"{pid}\n")
+    if os.path.abspath(PID_FILE) == os.path.abspath(LEGACY_PID_FILE):
+        return
     try:
-        for pid_path in [PID_FILE, LEGACY_PID_FILE]:
-            absolute_path = os.path.abspath(pid_path)
-            if absolute_path in written:
-                continue
-            _write_private_text(pid_path, f"{pid}\n")
-            written.add(absolute_path)
-    except OSError:
-        for pid_path in [PID_FILE, LEGACY_PID_FILE]:
-            _remove_owned_path(pid_path)
-        raise
+        _write_private_text(LEGACY_PID_FILE, f"{pid}\n")
+    except OSError as error:
+        log(f"Could not mirror recorder PID to legacy runtime: {type(error).__name__}")
 
 
 def _mirror_legacy_audio():
@@ -1105,6 +1103,10 @@ def _start_recording():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            # ffmpeg creates the WAV itself. A private child umask ensures the
+            # inode remains owner-only even when it is hard-linked to the
+            # optional legacy compatibility path under /tmp.
+            umask=0o077,
         )
         time.sleep(0.05)
         if proc.poll() is not None:
