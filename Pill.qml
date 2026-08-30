@@ -7,7 +7,7 @@ Item {
     id: root
 
     property bool isVisible: false
-    property string stateMode: "listening" // "listening", "paused", "transcribing", "done"
+    property string stateMode: "listening" // "listening", "paused", "transcribing", "status", "done"
     property string statusText: ""
     property bool dropdownOpen: false
     property string selectedModel: "whisper-base.en"
@@ -101,7 +101,9 @@ Item {
 
         function setTranscribing(text: string): string {
             hideTimer.stop()
-            root.statusText = text || "Transcribing..."
+            // Keep the in-progress label stable and concise. Temporary errors
+            // and notices use the separate status state below.
+            root.statusText = "Transcribing..."
             root.stateMode = "transcribing"
             root.isVisible = true
             root.dropdownOpen = false
@@ -121,7 +123,7 @@ Item {
 
         function setStatus(text: string): string {
             root.statusText = text || "Status"
-            root.stateMode = "transcribing"
+            root.stateMode = "status"
             root.isVisible = true
             root.dropdownOpen = false
             hideTimer.interval = 1800
@@ -459,6 +461,7 @@ Item {
                                 text: {
                                     if (root.stateMode === "paused") return "Paused"
                                     if (root.stateMode === "done") return root.statusText || "Done"
+                                    if (root.stateMode === "status") return root.statusText || "Status"
                                     if (root.stateMode === "transcribing") return "Transcribing..."
                                     if (root.selectedModel === "whisper-base.en") return "Whisper"
                                     if (root.selectedModel === "gemini-3.5-transcribe") return "3.5 Transcribe"
@@ -469,6 +472,7 @@ Item {
                                 font.weight: Font.DemiBold
                                 color: {
                                     if (root.stateMode === "paused") return "#FBBF24"
+                                    if (root.stateMode === "status") return "#FBBF24"
                                     if (root.stateMode === "done") return "#4ADE80"
                                     return "#FFFFFF"
                                 }
