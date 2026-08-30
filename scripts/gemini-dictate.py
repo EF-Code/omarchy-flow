@@ -624,6 +624,51 @@ def apply_hotkeys(overrides=None, settings_template=None):
     return True
 
 
+def remove_hotkeys():
+    """Remove only Flow's managed Hyprland block and preserve user bindings."""
+    bindings_path = _bindings_file()
+    previous = _read_owned_text(bindings_path)
+    if previous is None:
+        return not os.path.lexists(bindings_path)
+    if HOTKEY_MARKER_START not in previous or HOTKEY_MARKER_END not in previous:
+        return True
+
+    cleaned = _without_hotkey_block(previous).rstrip()
+    try:
+        if cleaned in {"", "-- Omarchy Flow managed bindings"}:
+            _remove_owned_path(bindings_path)
+        else:
+            _write_private_text(bindings_path, cleaned + "\n")
+        reload_result = subprocess.run(
+            ["hyprctl", "reload"], capture_output=True, text=True, timeout=5
+        )
+        if reload_result.returncode != 0:
+            raise RuntimeError("hyprctl reload failed")
+        errors_result = subprocess.run(
+            ["hyprctl", "configerrors"], capture_output=True, text=True, timeout=5
+        )
+        if errors_result.returncode != 0 or (errors_result.stdout + errors_result.stderr).strip():
+            raise RuntimeError("Hyprland reported configuration errors")
+    except (OSError, subprocess.SubprocessError, RuntimeError):
+        _restore_bindings(bindings_path, previous)
+        return False
+    return True
+
+
+def migrate_hotkeys():
+    """Refresh an existing managed block without installing new shortcuts."""
+    bindings_path = _bindings_file()
+    content = _read_owned_text(bindings_path)
+    if content is None:
+        return not os.path.lexists(bindings_path)
+    if HOTKEY_MARKER_START not in content or HOTKEY_MARKER_END not in content:
+        return True
+    expected_block = _hotkey_block(get_settings()["hotkeys"])
+    if expected_block in content:
+        return True
+    return apply_hotkeys()
+
+
 def run_audio_test():
     if not shutil.which("ffmpeg"):
         return {"ok": False, "message": "ffmpeg is not installed"}
@@ -1505,7 +1550,7 @@ def toggle_recording(auto_submit=None):
 
 
 def _usage():
-    return "Usage: gemini-dictate.py [start|stop|submit|pause|resume|cancel|toggle|toggle-submit|status|get-model|set-model <id>|list-models|settings]"
+    return "Usage: gemini-dictate.py [start|stop|submit|pause|resume|cancel|toggle|toggle-submit|status|get-model|set-model <id>|list-models|settings|doctor|apply-hotkeys|remove-hotkeys|migrate-hotkeys]"
 
 
 if __name__ == "__main__":
@@ -1581,6 +1626,17 @@ if __name__ == "__main__":
             print("Error: could not apply Flow hotkeys", file=sys.stderr)
             sys.exit(1)
         print(json.dumps(hotkeys_status(), separators=(",", ":")))
+        success = True
+    elif action == "remove-hotkeys":
+        if not remove_hotkeys():
+            print("Error: could not remove Flow hotkeys", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(hotkeys_status(), separators=(",", ":")))
+        success = True
+    elif action == "migrate-hotkeys":
+        if not migrate_hotkeys():
+            print("Error: could not migrate Flow hotkeys", file=sys.stderr)
+            sys.exit(1)
         success = True
     elif action == "doctor":
         print(json.dumps(diagnostics(), separators=(",", ":")))

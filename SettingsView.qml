@@ -178,6 +178,12 @@ Item {
     hotkeyApplyProcess.running = true
   }
 
+  function removeHotkeys() {
+    if (hotkeyRemoveProcess.running) return
+    root.notice = "Removing Flow shortcuts and reloading Hyprland…"
+    hotkeyRemoveProcess.running = true
+  }
+
   function loadAudioSources() {
     if (audioSourcesProcess.running) return
     audioSourcesProcess.running = true
@@ -300,6 +306,22 @@ Item {
         } catch (e) {}
       } else {
         root.notice = hotkeyApplyError.text ? "Could not apply shortcuts · check for conflicts" : "Could not apply shortcuts"
+        root.loadHotkeyStatus()
+      }
+    }
+  }
+
+  Process {
+    id: hotkeyRemoveProcess
+    command: [root.flowctlPath, "remove-hotkeys"]
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.hotkeysInstalled = false
+        root.hotkeyConflicts = []
+        root.notice = "Flow shortcuts removed · Hyprland reloaded"
+      } else {
+        root.notice = "Could not remove Flow shortcuts"
         root.loadHotkeyStatus()
       }
     }
@@ -767,6 +789,17 @@ Item {
         bordered: true
         enabled: !hotkeyApplyProcess.running
         onClicked: root.applyHotkeys()
+      }
+
+      Button {
+        visible: root.hotkeysInstalled
+        width: parent.width
+        text: "Remove installed shortcuts"
+        foreground: root.foreground
+        accent: Color.accent
+        bordered: true
+        enabled: !hotkeyRemoveProcess.running
+        onClicked: root.removeHotkeys()
       }
 
       Row {

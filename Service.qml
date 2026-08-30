@@ -37,6 +37,13 @@ Item {
     }
   }
 
+  // Upgrade only an existing Flow-managed block. This never installs
+  // shortcuts for users who have not opted into them.
+  Process {
+    command: [root.flowctlPath, "migrate-hotkeys"]
+    running: true
+  }
+
   IpcHandler {
     target: "io.github.ef-code.omarchy-flow.service"
 
