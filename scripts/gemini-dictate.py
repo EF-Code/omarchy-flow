@@ -1412,7 +1412,7 @@ def _stop_recording(auto_submit=False, pids=None):
 
     model_choice = get_selected_model()
     log(f"Recording finalized; transcribing with model {model_choice}")
-    pill_ipc("setTranscribing", f"Transcribing ({model_choice})...")
+    pill_ipc("setTranscribing", "Transcribing...")
     target_audio = _audio_target()
     try:
         if target_audio is None or os.path.getsize(target_audio) < 1000:
