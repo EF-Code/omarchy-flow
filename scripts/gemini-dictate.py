@@ -386,7 +386,10 @@ def reset_settings():
         bindings_path = _bindings_file()
         bindings_content = _read_owned_text(bindings_path) or ""
         if HOTKEY_MARKER_START in bindings_content and HOTKEY_MARKER_END in bindings_content:
-            return apply_hotkeys(copy.deepcopy(DEFAULT_SETTINGS["hotkeys"]))
+            return apply_hotkeys(
+                copy.deepcopy(DEFAULT_SETTINGS["hotkeys"]),
+                settings_template=copy.deepcopy(DEFAULT_SETTINGS),
+            )
         _write_settings(DEFAULT_SETTINGS)
     except OSError as error:
         log(f"Error resetting settings: {type(error).__name__}")
@@ -573,7 +576,7 @@ def _restore_bindings(path, previous):
         pass
 
 
-def apply_hotkeys(overrides=None):
+def apply_hotkeys(overrides=None, settings_template=None):
     hotkeys = _settings_hotkeys(overrides)
     if hotkeys is None:
         return False
@@ -595,7 +598,9 @@ def apply_hotkeys(overrides=None):
     old_settings = get_settings()
 
     try:
-        candidate_settings = copy.deepcopy(old_settings)
+        candidate_settings = copy.deepcopy(
+            settings_template if settings_template is not None else old_settings
+        )
         candidate_settings["hotkeys"] = hotkeys
         _write_settings(candidate_settings)
         _write_private_text(bindings_path, new_content)
