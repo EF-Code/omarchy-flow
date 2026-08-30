@@ -216,6 +216,34 @@ class TestFlowBackend(unittest.TestCase):
         self.assertFalse(sdk_check["ok"])
         self.assertFalse(report["ok"])
 
+    def test_local_diagnostics_require_downloaded_voxtype_model(self):
+        model_list = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Installed Whisper Models\n\n  tiny.en (75 MB)\n"
+        )
+        with patch.object(backend.shutil, "which", return_value="/usr/bin/tool"), patch(
+            "subprocess.run", return_value=model_list
+        ), patch.object(
+            backend, "list_audio_sources", return_value=[{"id": "default", "name": "System default"}]
+        ):
+            report = backend.diagnostics()
+
+        model_check = next(check for check in report["checks"] if check["id"] == "voxtype-model")
+        self.assertFalse(model_check["ok"])
+        self.assertIn("base.en", model_check["detail"])
+        self.assertFalse(report["ok"])
+
+        model_list.stdout += "  base.en (141 MB) - Good balance\n"
+        with patch.object(backend.shutil, "which", return_value="/usr/bin/tool"), patch(
+            "subprocess.run", return_value=model_list
+        ), patch.object(
+            backend, "list_audio_sources", return_value=[{"id": "default", "name": "System default"}]
+        ):
+            report = backend.diagnostics()
+
+        model_check = next(check for check in report["checks"] if check["id"] == "voxtype-model")
+        self.assertTrue(model_check["ok"])
+        self.assertTrue(report["ok"])
+
     def test_toggle_uses_saved_completion_action(self):
         self.assertTrue(backend.set_setting("toggle_action", "submit"))
         with patch.object(backend, "_active_recording_pids", return_value=[12345]), patch.object(
@@ -255,6 +283,63 @@ class TestFlowBackend(unittest.TestCase):
         self.assertNotIn("quickshell ipc call", content)
         self.assertNotIn("toggleSubmit", content)
         self.assertEqual(backend.get_settings()["hotkeys"]["toggle_submit"], "")
+
+    def test_reset_settings_restores_every_preference_with_installed_hotkeys(self):
+        reload_ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        self.assertTrue(backend.set_setting("toggle_action", "submit"))
+        self.assertTrue(backend.set_setting("copy_to_clipboard", "false"))
+        self.assertTrue(backend.set_setting("hud_enabled", "false"))
+
+        with patch("subprocess.run", return_value=reload_ok):
+            self.assertTrue(backend.apply_hotkeys({"toggle": "SUPER + ALT + F6"}))
+            self.assertTrue(backend.reset_settings())
+
+        self.assertEqual(backend.get_settings(), backend.DEFAULT_SETTINGS)
+
+    def test_remove_hotkeys_preserves_unrelated_bindings(self):
+        bindings_path = Path(backend.XDG_CONFIG_HOME) / "hypr" / "bindings.lua"
+        bindings_path.parent.mkdir(parents=True, mode=0o700)
+        bindings_path.write_text(
+            "o.bind(\"SUPER + T\", \"Terminal\", \"foot\")\n\n"
+            + backend._hotkey_block(backend.DEFAULT_SETTINGS["hotkeys"])
+            + "\n\no.bind(\"SUPER + B\", \"Browser\", \"brave\")\n"
+        )
+        reload_ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", return_value=reload_ok):
+            self.assertTrue(backend.remove_hotkeys())
+
+        content = bindings_path.read_text()
+        self.assertIn('o.bind("SUPER + T"', content)
+        self.assertIn('o.bind("SUPER + B"', content)
+        self.assertNotIn(backend.HOTKEY_MARKER_START, content)
+        self.assertNotIn(backend.HOTKEY_MARKER_END, content)
+
+    def test_migrate_hotkeys_refreshes_only_an_existing_managed_block(self):
+        bindings_path = Path(backend.XDG_CONFIG_HOME) / "hypr" / "bindings.lua"
+        bindings_path.parent.mkdir(parents=True, mode=0o700)
+        bindings_path.write_text(
+            "o.bind(\"SUPER + T\", \"Terminal\", \"foot\")\n\n"
+            + backend.HOTKEY_MARKER_START
+            + "\n-- old Flow block\n"
+            + 'o.bind("F6", "Flow: Push to talk", "quickshell ipc call old.target start")\n'
+            + backend.HOTKEY_MARKER_END
+            + "\n"
+        )
+        reload_ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", return_value=reload_ok):
+            self.assertTrue(backend.migrate_hotkeys())
+
+        content = bindings_path.read_text()
+        self.assertIn('o.bind("SUPER + T"', content)
+        self.assertIn("omarchy-shell io.github.ef-code.omarchy-flow.service start", content)
+        self.assertNotIn("old.target", content)
+
+        bindings_path.unlink()
+        with patch.object(backend, "apply_hotkeys") as apply:
+            self.assertTrue(backend.migrate_hotkeys())
+        apply.assert_not_called()
 
     def test_get_current_state(self):
         state = backend.get_current_state()
@@ -379,6 +464,14 @@ class TestFlowBackend(unittest.TestCase):
         )
         self.assertNotEqual(unknown.returncode, 0)
 
+        remove_result = subprocess.run(
+            [str(flowctl), "remove-hotkeys"],
+            env=self.child_env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(remove_result.returncode, 0, remove_result.stderr)
+
     def test_extract_voxtype_text(self):
         output = (
             "\x1b[32mLoading model\x1b[0m\n"
@@ -393,7 +486,11 @@ class TestFlowBackend(unittest.TestCase):
         )
         with patch("subprocess.run", return_value=success) as run:
             self.assertEqual(backend._transcribe_local("recording.wav"), "Hello")
-        self.assertEqual(run.call_args.args[0], ["voxtype", "transcribe", "recording.wav"])
+        self.assertEqual(
+            run.call_args.args[0],
+            ["voxtype", "--model", "base.en", "transcribe", "recording.wav"],
+        )
+        self.assertEqual(run.call_args.kwargs["timeout"], 120)
 
         failure = subprocess.CompletedProcess(args=[], returncode=1, stdout="")
         with patch("subprocess.run", return_value=failure):
@@ -513,8 +610,21 @@ class TestFlowBackend(unittest.TestCase):
         self.assertIn('if (root.stateMode === "status") return root.statusText', pill)
         self.assertIn("property var actionQueue", service)
         self.assertIn('return "queued"', service)
+        self.assertIn('command: [root.flowctlPath, "migrate-hotkeys"]', service)
         self.assertIn("property var settingWriteQueue", settings)
         self.assertIn("root.settingWriteQueue.push(command)", settings)
+        self.assertIn('command: [root.flowctlPath, "remove-hotkeys"]', settings)
+
+    def test_release_version_is_synchronised(self):
+        manifest = json.loads((REPO_ROOT / "manifest.json").read_text())
+        settings = (REPO_ROOT / "SettingsView.qml").read_text()
+        changelog = (REPO_ROOT / "CHANGELOG.md").read_text()
+        security = (REPO_ROOT / "SECURITY.md").read_text()
+
+        self.assertEqual(manifest["version"], "0.4.0")
+        self.assertIn("Omarchy Flow 0.4.0", settings)
+        self.assertIn("## [0.4.0] - 2026-08-30", changelog)
+        self.assertIn("| 0.4.x", security)
 
 
 if __name__ == "__main__":
