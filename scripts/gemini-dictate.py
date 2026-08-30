@@ -534,18 +534,18 @@ def _hotkey_block(hotkeys):
         if hotkey_id == "push_to_talk":
             lines.append(
                 f'o.bind({_lua_string(shortcut)}, "Flow: Push to talk", '
-                '"quickshell ipc call io.github.ef-code.omarchy-flow.service start")'
+                '"omarchy-shell io.github.ef-code.omarchy-flow.service start")'
             )
             lines.append(
                 f'o.bind({_lua_string(shortcut)}, "Flow: Push to talk (release)", '
-                '"quickshell ipc call io.github.ef-code.omarchy-flow.service stop", '
+                '"omarchy-shell io.github.ef-code.omarchy-flow.service stop", '
                 "{ release = true })"
             )
             continue
         description, action = commands[hotkey_id]
         lines.append(
             f'o.bind({_lua_string(shortcut)}, {_lua_string(description)}, '
-            f'"quickshell ipc call io.github.ef-code.omarchy-flow.service {action}")'
+            f'"omarchy-shell io.github.ef-code.omarchy-flow.service {action}")'
         )
     lines.append(HOTKEY_MARKER_END)
     return "\n".join(lines)
