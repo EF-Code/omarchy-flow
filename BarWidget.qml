@@ -347,7 +347,7 @@ BarWidget {
           accent: Color.accent
           bordered: true
           enabled: !actionProcess.running
-          onClicked: root.closeAfterAction("submit")
+          onClicked: root.closeAfterAction("stop")
         }
 
         Button {
