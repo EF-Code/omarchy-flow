@@ -31,6 +31,7 @@ Item {
   property string notice: ""
   property string audioTestResult: ""
   property string settingsPage: "overview"
+  property var settingWriteQueue: []
 
   readonly property color foreground: Color.popups.text
   readonly property color mutedForeground: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.68)
@@ -122,8 +123,26 @@ Item {
   }
 
   function setPreference(key, value) {
-    if (settingsWriteProcess.running) return
-    settingsWriteProcess.command = [root.flowctlPath, "set-setting", key, String(value)]
+    var command = [root.flowctlPath, "set-setting", key, String(value)]
+    if (settingsWriteProcess.running || root.settingWriteQueue.length > 0) {
+      // Coalesce repeated edits to the same preference while preserving the
+      // order of changes to different preferences.
+      for (var i = 0; i < root.settingWriteQueue.length; i++) {
+        if (root.settingWriteQueue[i][2] === key) {
+          root.settingWriteQueue[i] = command
+          return
+        }
+      }
+      root.settingWriteQueue.push(command)
+      return
+    }
+    settingsWriteProcess.command = command
+    settingsWriteProcess.running = true
+  }
+
+  function runNextSettingWrite() {
+    if (settingsWriteProcess.running || root.settingWriteQueue.length === 0) return
+    settingsWriteProcess.command = root.settingWriteQueue.shift()
     settingsWriteProcess.running = true
   }
 
@@ -217,6 +236,7 @@ Item {
     onExited: function(exitCode) {
       if (exitCode === 0) root.notice = "Preference saved"
       else root.notice = "Could not save preference"
+      Qt.callLater(root.runNextSettingWrite)
     }
   }
 
