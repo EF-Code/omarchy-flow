@@ -74,7 +74,9 @@ def _runtime_home():
 
 def _is_within_runtime(path):
     try:
-        return os.path.commonpath([os.path.abspath(path), os.path.abspath(RUNTIME_DIR)]) == os.path.abspath(RUNTIME_DIR)
+        runtime_real = os.path.realpath(RUNTIME_DIR)
+        path_real = os.path.realpath(path)
+        return os.path.commonpath([path_real, runtime_real]) == runtime_real
     except (ValueError, OSError):
         return False
 
@@ -211,6 +213,13 @@ def _kill_process_group(pid, sig):
 def _run_captured(args, *, timeout, text=False, env=None,
                   max_output_bytes=MAX_CAPTURED_OUTPUT_BYTES):
     """Run a child in its own session with group-wide TERM->KILL and output caps."""
+    # Scrub dangerous env vars even when caller passes None (inherit)
+    if env is None:
+        env = os.environ.copy()
+    else:
+        env = dict(env)
+    for _bad in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "LD_DEBUG", "PYTHONPATH", "PYTHONHOME"):
+        env.pop(_bad, None)
     process = subprocess.Popen(
         args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, env=env,
@@ -1125,6 +1134,27 @@ def _rotate_logs_if_needed():
             os.rename(base, f"{base}.1", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except OSError:
             pass
+        # Truncate any backup that still exceeds ceiling (e.g., injected oversized log)
+        for i in range(1, MAX_LOG_BACKUPS + 1):
+            bname = f"{base}.{i}"
+            try:
+                bfd = os.open(bname, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
+            except OSError:
+                continue
+            try:
+                bi = os.fstat(bfd)
+                if not stat.S_ISREG(bi.st_mode) or bi.st_uid != os.getuid() or bi.st_nlink != 1:
+                    continue
+                if bi.st_size > MAX_LOG_BYTES:
+                    try:
+                        os.ftruncate(bfd, MAX_LOG_BYTES)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    os.close(bfd)
+                except OSError:
+                    pass
     except OSError:
         pass
     finally:
@@ -1350,7 +1380,7 @@ def _read_pid(path):
 def _process_cmdline(pid):
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as handle:
-            raw = handle.read()
+            raw = handle.read(8192)
         return [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
     except (OSError, UnicodeError):
         return []
@@ -1359,7 +1389,7 @@ def _process_cmdline(pid):
 def _process_start_ticks(pid):
     try:
         with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
-            stat_line = handle.read()
+            stat_line = handle.read(8192)
         closing_name = stat_line.rfind(")")
         if closing_name < 0:
             return None
@@ -1379,7 +1409,7 @@ def _process_alive(pid):
         return False
     try:
         with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
-            stat_line = handle.read()
+            stat_line = handle.read(8192)
         closing_name = stat_line.rfind(")")
         if closing_name >= 0 and stat_line[closing_name + 2 :].split()[0] == "Z":
             return False
@@ -1771,6 +1801,9 @@ def _start_recording():
         return False
 
     try:
+        _clean_env = os.environ.copy()
+        for _bad in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "LD_DEBUG", "PYTHONPATH", "PYTHONHOME"):
+            _clean_env.pop(_bad, None)
         proc = subprocess.Popen(
             [
                 "ffmpeg", "-loglevel", "error",
@@ -1786,6 +1819,7 @@ def _start_recording():
             start_new_session=True,
             close_fds=True,
             umask=0o077,
+            env=_clean_env,
         )
         time.sleep(0.05)
         if proc.poll() is not None:
@@ -2172,12 +2206,22 @@ def _transcribe_cloud(target_audio, model_choice):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("transcription deadline exceeded")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(fn, *args, **kwargs)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(fn, *args, **kwargs)
+        try:
+            return future.result(timeout=remaining)
+        except concurrent.futures.TimeoutError as exc:
             try:
-                return future.result(timeout=remaining)
-            except concurrent.futures.TimeoutError as exc:
-                raise TimeoutError("transcription deadline exceeded") from exc
+                future.cancel()
+            except Exception:
+                pass
+            raise TimeoutError("transcription deadline exceeded") from exc
+        finally:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # cancel_futures not available on older Python
+                executor.shutdown(wait=False)
 
     if model_choice == "gemini-3.5-transcribe":
         audio_file = _bounded_call(client.files.upload,
@@ -2244,13 +2288,17 @@ def _inject_text(text, auto_submit=False):
         text = b.decode("utf-8", errors="ignore")
     if not text:
         return False
+    # Scrub env for clipboard/typing helpers
+    _clean_env = os.environ.copy()
+    for _bad in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "LD_DEBUG", "PYTHONPATH", "PYTHONHOME"):
+        _clean_env.pop(_bad, None)
     clipboard_ok = False
     copy_to_clipboard = get_settings()["copy_to_clipboard"]
     if copy_to_clipboard:
         try:
             result = subprocess.run(
                 ["wl-copy", "--sensitive"], input=text, text=True, check=False, timeout=5,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_clean_env
             )
             clipboard_ok = result.returncode == 0
         except (OSError, subprocess.SubprocessError):
@@ -2262,7 +2310,7 @@ def _inject_text(text, auto_submit=False):
     try:
         typed = subprocess.run(
             ["wtype", "-"], input=text, text=True, check=False, timeout=5,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_clean_env
         )
         if typed.returncode != 0:
             return False
@@ -2273,7 +2321,7 @@ def _inject_text(text, auto_submit=False):
         time.sleep(0.08)
         try:
             submitted = subprocess.run(["wtype", "-k", "Return"], check=False, timeout=5,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_clean_env)
             if submitted.returncode != 0:
                 return False
             log("Auto-submit triggered")

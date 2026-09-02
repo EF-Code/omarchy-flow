@@ -21,6 +21,10 @@ BarWidget {
     { id: "gemini-3.7-flash", title: "Gemini 3.7 Flash", subtitle: "Cloud · Speech understanding" }
   ]
 
+  // Per-instance jitter de-syncs concurrent polls when the bar creates one
+  // widget per monitor, avoiding a thundering herd on flowctl status.
+  readonly property int pollJitter: Math.floor(Math.random() * 700)
+
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -136,10 +140,13 @@ BarWidget {
   }
 
   Timer {
-    interval: root.isRecording ? 1000 : 3000
+    interval: (root.isRecording ? 1000 : 3000) + root.pollJitter
     repeat: true
     running: true
-    onTriggered: root.refreshStatus()
+    onTriggered: {
+      if (actionProcess.running) return
+      root.refreshStatus()
+    }
   }
 
   BarIconButton {

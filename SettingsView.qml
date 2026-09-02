@@ -484,6 +484,7 @@ Item {
             font.pixelSize: Style.font.subtitle
             font.bold: true
             elide: Text.ElideRight
+            textFormat: Text.PlainText
           }
 
           Text {
@@ -493,6 +494,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
+            textFormat: Text.PlainText
           }
         }
       }
@@ -539,6 +541,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
       }
 
       Repeater {
@@ -575,6 +578,7 @@ Item {
                 font.pixelSize: Style.font.body
                 font.bold: true
                 elide: Text.ElideRight
+                textFormat: Text.PlainText
               }
 
               Text {
@@ -584,6 +588,7 @@ Item {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
+                textFormat: Text.PlainText
               }
             }
 
@@ -594,6 +599,7 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.subtitle
               anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
             }
           }
 
@@ -623,6 +629,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
       }
 
       Text {
@@ -631,6 +638,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         font.bold: true
+        textFormat: Text.PlainText
       }
 
       FlowDropdown {
@@ -651,6 +659,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         font.bold: true
+        textFormat: Text.PlainText
       }
 
       FlowDropdown {
@@ -700,6 +709,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             font.bold: true
+            textFormat: Text.PlainText
           }
 
           Text {
@@ -711,6 +721,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
           }
         }
       }
@@ -746,6 +757,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             font.bold: true
+            textFormat: Text.PlainText
           }
 
           Text {
@@ -755,6 +767,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
           }
         }
       }
@@ -831,6 +844,7 @@ Item {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           font.bold: true
+          textFormat: Text.PlainText
         }
 
         Repeater {
@@ -901,6 +915,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
       }
     }
   }
@@ -919,6 +934,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
       }
 
       Text {
@@ -927,6 +943,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         font.bold: true
+        textFormat: Text.PlainText
       }
 
       FlowDropdown {
@@ -973,6 +990,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             font.bold: true
+            textFormat: Text.PlainText
           }
 
           Text {
@@ -982,6 +1000,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
           }
         }
       }
@@ -1002,6 +1021,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
       }
 
       Toggle {
@@ -1020,6 +1040,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         font.bold: true
+        textFormat: Text.PlainText
       }
 
       FlowDropdown {
@@ -1069,6 +1090,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             font.bold: true
+            textFormat: Text.PlainText
           }
 
           Text {
@@ -1078,6 +1100,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
           }
         }
       }
@@ -1098,6 +1121,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
       }
 
       Column {
@@ -1129,6 +1153,7 @@ Item {
                 font.pixelSize: Style.font.body
                 font.bold: true
                 anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
               }
 
               Column {
@@ -1169,6 +1194,7 @@ Item {
         color: root.mutedForeground
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
+        textFormat: Text.PlainText
       }
 
       Row {
@@ -1238,6 +1264,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.subtitle
             font.bold: true
+            textFormat: Text.PlainText
           }
 
           Text {
@@ -1247,6 +1274,7 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
           }
         }
       }
@@ -1278,6 +1306,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
       }
     }
   }

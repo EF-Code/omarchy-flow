@@ -52,16 +52,23 @@ Item {
   signal hovered(bool isHovered)
 
   function optionValue(o) {
-    return (o && typeof o === "object") ? String(o.value) : String(o)
+    var v = (o && typeof o === "object") ? String(o.value) : String(o)
+    if (v.length > 256) v = v.slice(0, 256)
+    return v
   }
   function optionLabel(o) {
-    return (o && typeof o === "object") ? String(o.label) : String(o)
+    var l = (o && typeof o === "object") ? String(o.label) : String(o)
+    if (l.length > 256) l = l.slice(0, 256)
+    return l
   }
   function currentLabel() {
-    for (var i = 0; i < options.length; i++) {
-      if (optionValue(options[i]) === value) return optionLabel(options[i])
+    var v = String(value)
+    if (v.length > 256) v = v.slice(0, 256)
+    var capped = Math.min(options.length, 32)
+    for (var i = 0; i < capped; i++) {
+      if (optionValue(options[i]) === v) return optionLabel(options[i])
     }
-    return value
+    return v
   }
 
   implicitWidth: Style.spacing.dropdownWidth
@@ -134,6 +141,7 @@ Item {
         color: Qt.darker(root.foreground, 1.2)
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
+        textFormat: Text.PlainText
       }
 
       MouseArea {
@@ -150,7 +158,8 @@ Item {
         x: 0
         y: trigger.height + Style.spacing.xxs
         width: trigger.width
-        implicitHeight: Math.min(root.options.length * root.popupRowHeight + Math.max(0, root.options.length - 1) * Style.spacing.labelGap + Style.spacing.xxs,
+        readonly property int cappedCount: Math.min(root.options.length, 32)
+        implicitHeight: Math.min(popup.cappedCount * root.popupRowHeight + Math.max(0, popup.cappedCount - 1) * Style.spacing.labelGap + Style.spacing.xxs,
                                  root.popupRowHeight * 8 + 7 * Style.spacing.labelGap + Style.spacing.xxs)
         padding: Style.spacing.hairline
         leftPadding: Border.left(root.popupBorderSpec) + Style.spacing.hairline
@@ -181,9 +190,10 @@ Item {
 
           Keys.priority: Keys.BeforeItem
           Keys.onPressed: function(event) {
+            var cap = Math.min(root.options.length, 32)
             if (event.key === Qt.Key_Escape) { popup.close(); event.accepted = true }
             else if (event.key === Qt.Key_Down || event.text === "j") {
-              optionList.currentIndex = Math.min(root.options.length - 1, optionList.currentIndex + 1)
+              optionList.currentIndex = Math.min(cap - 1, optionList.currentIndex + 1)
               event.accepted = true
             } else if (event.key === Qt.Key_Up || event.text === "k") {
               optionList.currentIndex = Math.max(0, optionList.currentIndex - 1)
@@ -195,18 +205,23 @@ Item {
           implicitHeight: contentHeight
           clip: true
           boundsBehavior: Flickable.StopAtBounds
-          model: root.options
+          model: root.options.slice(0, Math.min(root.options.length, 32))
           currentIndex: -1
 
           function indexOfValue(v) {
-            for (var i = 0; i < root.options.length; i++)
-              if (root.optionValue(root.options[i]) === v) return i
+            var sv = String(v)
+            if (sv.length > 256) sv = sv.slice(0, 256)
+            var cap = Math.min(root.options.length, 32)
+            for (var i = 0; i < cap; i++)
+              if (root.optionValue(root.options[i]) === sv) return i
             return -1
           }
 
           function selectCurrent() {
-            if (currentIndex < 0 || currentIndex >= root.options.length) return
+            var cap = Math.min(root.options.length, 32)
+            if (currentIndex < 0 || currentIndex >= cap) return
             var v = root.optionValue(root.options[currentIndex])
+            if (v.length > 256) v = v.slice(0, 256)
             root.value = v
             root.changed(v)
             popup.close()
