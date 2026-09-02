@@ -123,7 +123,7 @@ Item {
   }
 
   function setPreference(key, value) {
-    var command = [root.flowctlPath, "set-setting", key, String(value)]
+    var command = [root.flowctlPath, "qml", "set-setting", key, String(value)]
     if (settingsWriteProcess.running || root.settingWriteQueue.length > 0) {
       // Coalesce repeated edits to the same preference while preserving the
       // order of changes to different preferences.
@@ -174,7 +174,7 @@ Item {
   function applyHotkeys() {
     if (hotkeyApplyProcess.running) return
     root.notice = "Applying shortcuts and reloading Hyprland…"
-    hotkeyApplyProcess.command = [root.flowctlPath, "apply-hotkeys", JSON.stringify(root.hotkeys)]
+    hotkeyApplyProcess.command = [root.flowctlPath, "qml", "apply-hotkeys", JSON.stringify(root.hotkeys)]
     hotkeyApplyProcess.running = true
   }
 
@@ -220,7 +220,7 @@ Item {
 
   Process {
     id: settingsProcess
-    command: [root.flowctlPath, "settings"]
+    command: [root.flowctlPath, "qml", "settings"]
     running: true
     stdout: StdioCollector {
       id: settingsOutput
@@ -254,7 +254,7 @@ Item {
 
   Process {
     id: audioSourcesProcess
-    command: [root.flowctlPath, "list-audio-sources"]
+    command: [root.flowctlPath, "qml", "list-audio-sources"]
     stdout: StdioCollector {
       id: audioSourcesOutput
       waitForEnd: true
@@ -284,7 +284,7 @@ Item {
 
   Process {
     id: hotkeyStatusProcess
-    command: [root.flowctlPath, "hotkeys-status"]
+    command: [root.flowctlPath, "qml", "hotkeys-status"]
     stdout: StdioCollector {
       id: hotkeyStatusOutput
       waitForEnd: true
@@ -346,11 +346,11 @@ Item {
     }
     Component.onDestruction: if (running) running = false
   }
-  Timer { interval: 8000; running: hotkeyApplyProcess.running; onTriggered: hotkeyApplyProcess.running = false }
+  Timer { interval: 25000; running: hotkeyApplyProcess.running; onTriggered: hotkeyApplyProcess.running = false }
 
   Process {
     id: hotkeyRemoveProcess
-    command: [root.flowctlPath, "remove-hotkeys"]
+    command: [root.flowctlPath, "qml", "remove-hotkeys"]
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode) {
@@ -365,11 +365,11 @@ Item {
     }
     Component.onDestruction: if (running) running = false
   }
-  Timer { interval: 8000; running: hotkeyRemoveProcess.running; onTriggered: hotkeyRemoveProcess.running = false }
+  Timer { interval: 25000; running: hotkeyRemoveProcess.running; onTriggered: hotkeyRemoveProcess.running = false }
 
   Process {
     id: doctorProcess
-    command: [root.flowctlPath, "doctor"]
+    command: [root.flowctlPath, "qml", "doctor"]
     stdout: StdioCollector {
       id: doctorOutput
       waitForEnd: true
@@ -392,11 +392,11 @@ Item {
     }
     Component.onDestruction: if (running) running = false
   }
-  Timer { interval: 8000; running: doctorProcess.running; onTriggered: doctorProcess.running = false }
+  Timer { interval: 25000; running: doctorProcess.running; onTriggered: doctorProcess.running = false }
 
   Process {
     id: audioTestProcess
-    command: [root.flowctlPath, "test-audio"]
+    command: [root.flowctlPath, "qml", "test-audio"]
     stdout: StdioCollector {
       id: audioTestOutput
       waitForEnd: true
@@ -419,7 +419,7 @@ Item {
 
   Process {
     id: resetProcess
-    command: [root.flowctlPath, "reset-settings"]
+    command: [root.flowctlPath, "qml", "reset-settings"]
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode) {

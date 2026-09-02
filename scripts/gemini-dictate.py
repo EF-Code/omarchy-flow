@@ -24,7 +24,7 @@ import shutil
 import importlib.util
 import selectors
 import io
-import concurrent.futures
+import multiprocessing
 
 # Dynamically discover and include virtual environment site-packages (e.g. ~/.venv)
 def _ensure_venv_packages():
@@ -136,12 +136,15 @@ MAX_AUDIO_BYTES = 20 * 1024 * 1024
 MIN_FREE_SPACE_BYTES = 64 * 1024 * 1024
 NETWORK_TIMEOUT_MS = 60_000
 MAX_CAPTURED_OUTPUT_BYTES = 1024 * 1024
+MAX_QML_OUTPUT_BYTES = 16 * 1024
+QML_JOB_TIMEOUT_SECONDS = 130
 MAX_READ_BYTES = 1 * 1024 * 1024
 MAX_LOG_BYTES = 512 * 1024
 MAX_LOG_BACKUPS = 3
 MAX_TRANSCRIPT_CHARS = 20000
 MAX_TRANSCRIPT_BYTES = 65536
 TRANSCRIBE_DEADLINE_SECONDS = 90
+CLOUD_CLEANUP_RESERVE_SECONDS = 5
 CAPTURE_DIR_PREFIX = ".cap-"
 WATCHDOG_GRACE_TERM_SECONDS = 0.5
 WATCHDOG_GRACE_KILL_SECONDS = 0.5
@@ -196,22 +199,96 @@ class CapturedOutputLimitError(subprocess.SubprocessError):
     """Raised after stopping a child that exceeds a captured-output ceiling."""
 
 
-def _kill_process_group(pid, sig):
-    try:
-        pgid = os.getpgid(pid)
-    except OSError:
-        pgid = pid
+def _kill_process_group(pgid, sig):
     try:
         os.killpg(pgid, sig)
     except OSError:
+        pass
+
+
+def _process_group_exists(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _descendant_pidfds(root_pid):
+    """Snapshot same-UID descendants and pin identities against PID reuse."""
+    if not hasattr(os, "pidfd_open"):
+        return []
+    children = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
         try:
-            os.kill(pid, sig)
+            if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+                continue
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+                fields = handle.read(8192)
+            closing = fields.rfind(")")
+            ppid = int(fields[closing + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(pid)
+    pending = list(children.get(root_pid, []))
+    descendants = []
+    while pending:
+        pid = pending.pop()
+        descendants.append(pid)
+        pending.extend(children.get(pid, []))
+    pidfds = []
+    for pid in descendants:
+        try:
+            pidfds.append(os.pidfd_open(pid))
+        except OSError:
+            pass
+    return pidfds
+
+
+def _signal_pidfds(pidfds, sig):
+    if not hasattr(signal, "pidfd_send_signal"):
+        return
+    for pidfd in pidfds:
+        try:
+            signal.pidfd_send_signal(pidfd, sig)
         except OSError:
             pass
 
 
+def _stop_captured_process_group(process, pgid):
+    """Stop the stored group even when its original leader already exited."""
+    descendant_pidfds = _descendant_pidfds(process.pid)
+    process.poll()  # Reap an already-exited leader without losing the stored pgid.
+    _kill_process_group(pgid, signal.SIGTERM)
+    _signal_pidfds(descendant_pidfds, signal.SIGTERM)
+    term_deadline = time.monotonic() + WATCHDOG_GRACE_TERM_SECONDS
+    while _process_group_exists(pgid) and time.monotonic() < term_deadline:
+        time.sleep(0.01)
+    if _process_group_exists(pgid):
+        _kill_process_group(pgid, signal.SIGKILL)
+        kill_deadline = time.monotonic() + WATCHDOG_GRACE_KILL_SECONDS
+        while _process_group_exists(pgid) and time.monotonic() < kill_deadline:
+            time.sleep(0.01)
+    _signal_pidfds(descendant_pidfds, signal.SIGKILL)
+    try:
+        process.wait(timeout=WATCHDOG_GRACE_KILL_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        for pidfd in descendant_pidfds:
+            try:
+                os.close(pidfd)
+            except OSError:
+                pass
+
+
 def _run_captured(args, *, timeout, text=False, env=None,
-                  max_output_bytes=MAX_CAPTURED_OUTPUT_BYTES):
+                  max_output_bytes=MAX_CAPTURED_OUTPUT_BYTES, pass_fds=()):
     """Run a child in its own session with group-wide TERM->KILL and output caps."""
     # Scrub dangerous env vars even when caller passes None (inherit)
     if env is None:
@@ -225,6 +302,7 @@ def _run_captured(args, *, timeout, text=False, env=None,
         stderr=subprocess.PIPE, env=env,
         start_new_session=True,
         close_fds=True,
+        pass_fds=pass_fds,
     )
     # Hold pgid early; start_new_session makes pgid == pid
     try:
@@ -241,19 +319,11 @@ def _run_captured(args, *, timeout, text=False, env=None,
             pass
 
     deadline = time.monotonic() + timeout
+    cleanup_attempted = False
     try:
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                _kill_process_group(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=WATCHDOG_GRACE_TERM_SECONDS)
-                except subprocess.TimeoutExpired:
-                    _kill_process_group(process.pid, signal.SIGKILL)
-                    try:
-                        process.wait(timeout=WATCHDOG_GRACE_KILL_SECONDS)
-                    except subprocess.TimeoutExpired:
-                        pass
                 raise subprocess.TimeoutExpired(args, timeout)
             timeout_for_select = max(0, remaining)
             # Use small chunk timeout to remain responsive
@@ -280,15 +350,6 @@ def _run_captured(args, *, timeout, text=False, env=None,
                     continue
                 output = streams[key.fileobj]
                 if len(output) + len(chunk) > max_output_bytes:
-                    _kill_process_group(process.pid, signal.SIGTERM)
-                    try:
-                        process.wait(timeout=WATCHDOG_GRACE_TERM_SECONDS)
-                    except subprocess.TimeoutExpired:
-                        _kill_process_group(process.pid, signal.SIGKILL)
-                        try:
-                            process.wait(timeout=WATCHDOG_GRACE_KILL_SECONDS)
-                        except subprocess.TimeoutExpired:
-                            pass
                     raise CapturedOutputLimitError(
                         f"child output exceeded {max_output_bytes} bytes"
                     )
@@ -298,34 +359,10 @@ def _run_captured(args, *, timeout, text=False, env=None,
         try:
             returncode = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
-            _kill_process_group(process.pid, signal.SIGTERM)
-            try:
-                returncode = process.wait(timeout=WATCHDOG_GRACE_TERM_SECONDS)
-            except subprocess.TimeoutExpired:
-                _kill_process_group(process.pid, signal.SIGKILL)
-                try:
-                    returncode = process.wait(timeout=WATCHDOG_GRACE_KILL_SECONDS)
-                except subprocess.TimeoutExpired:
-                    returncode = process.poll() or 124
-                raise subprocess.TimeoutExpired(args, timeout)
+            raise subprocess.TimeoutExpired(args, timeout)
     except BaseException:
-        if process.poll() is None:
-            _kill_process_group(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=WATCHDOG_GRACE_TERM_SECONDS)
-            except subprocess.TimeoutExpired:
-                _kill_process_group(process.pid, signal.SIGKILL)
-                try:
-                    process.wait(timeout=WATCHDOG_GRACE_KILL_SECONDS)
-                except subprocess.TimeoutExpired:
-                    pass
-            except Exception:
-                pass
-            # Ensure reap
-            try:
-                process.wait(timeout=0.2)
-            except Exception:
-                pass
+        _stop_captured_process_group(process, pgid)
+        cleanup_attempted = True
         raise
     finally:
         try:
@@ -339,12 +376,8 @@ def _run_captured(args, *, timeout, text=False, env=None,
                 pass
         # Close any inherited pipe ends by ensuring process pipes are closed
         # Reap if still alive
-        if process.poll() is None:
-            try:
-                _kill_process_group(process.pid, signal.SIGKILL)
-                process.wait(timeout=0.2)
-            except Exception:
-                pass
+        if not cleanup_attempted and (process.poll() is None or _process_group_exists(pgid)):
+            _stop_captured_process_group(process, pgid)
 
     stdout = bytes(streams[process.stdout])
     stderr = bytes(streams[process.stderr])
@@ -980,20 +1013,21 @@ def run_audio_test():
         return {"ok": False, "message": "ffmpeg is not installed"}
     target = None
     capture_dir = None
+    capture_fd = None
     try:
-        _ensure_private_dir(RUNTIME_DIR)
-        capture_dir = tempfile.mkdtemp(prefix=".audio-test-", dir=RUNTIME_DIR)
-        os.chmod(capture_dir, 0o700)
-        target = os.path.join(capture_dir, "test.wav")
+        target, capture_dir, capture_fd = _create_exclusive_capture_target()
         result = _run_captured(
             [
                 "ffmpeg", "-loglevel", "error", "-f", "pulse",
                 "-i", get_settings()["audio_source"], "-t", "0.5", "-ar", "16000",
-                "-ac", "1", target,
+                "-ac", "1", "-f", "wav", "-y", f"/proc/self/fd/{capture_fd}",
             ],
             text=True,
             timeout=5,
+            pass_fds=(capture_fd,),
         )
+        os.close(capture_fd)
+        capture_fd = None
         size = os.path.getsize(target) if os.path.exists(target) else 0
         # Enforce size ceiling
         if size > MAX_AUDIO_BYTES:
@@ -1004,6 +1038,11 @@ def run_audio_test():
     except (OSError, subprocess.SubprocessError):
         return {"ok": False, "message": "Microphone capture failed"}
     finally:
+        if capture_fd is not None:
+            try:
+                os.close(capture_fd)
+            except OSError:
+                pass
         if target and os.path.exists(target):
             _remove_owned_path(target)
         if capture_dir and os.path.isdir(capture_dir):
@@ -1302,7 +1341,7 @@ def _read_private_secret(path):
         return None
     return _secret_from_value(_read_owned_text(path) or "")
 
-def get_gemini_api_key():
+def get_gemini_api_key(deadline=None):
     """Load a Gemini API key without logging or exposing its value."""
     env_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if env_key:
@@ -1315,8 +1354,11 @@ def get_gemini_api_key():
         ["secret-tool", "lookup", "service", "gemini"],
     ]
     for args in lookups:
+        remaining = 2 if deadline is None else min(2, deadline - time.monotonic())
+        if remaining <= 0:
+            return None
         try:
-            res = _run_captured(args, text=True, timeout=2)
+            res = _run_captured(args, text=True, timeout=remaining)
             if res.returncode == 0:
                 key = _secret_from_value(res.stdout)
                 if key:
@@ -1330,6 +1372,8 @@ def get_gemini_api_key():
         os.path.join(XDG_CONFIG_HOME, "omarchy", "gemini_api_key"),
     ]
     for kf in key_files:
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
         key = _read_private_secret(kf)
         if key:
             return key
@@ -1451,6 +1495,13 @@ def _is_recorder_process(pid):
             return True
         if ap.startswith(runtime_abs) and ap.endswith(".wav"):
             # Ensure path is under runtime and not a symlink outside
+            return True
+    # Hardened recorders write to an already-open inherited descriptor instead
+    # of reopening the pathname. The PID/start-ticks state check binds this
+    # otherwise fixed ffmpeg shape to the recorder Flow actually launched.
+    if len(args) >= 4 and args[-4:-2] == ["-f", "wav"] and args[-2] == "-y":
+        pipe_target = args[-1]
+        if pipe_target.startswith("/proc/self/fd/") and pipe_target.rsplit("/", 1)[-1].isdigit():
             return True
     return False
 
@@ -1695,18 +1746,49 @@ def get_current_state():
     }
 
 def _create_exclusive_capture_target():
-    # Creates an exclusive private directory and returns wav path inside it (not yet existing)
+    """Create and hold the exact private inode ffmpeg will write."""
     _ensure_private_dir(RUNTIME_DIR)
-    # Use mkdtemp which is exclusive
     capture_dir = tempfile.mkdtemp(prefix=CAPTURE_DIR_PREFIX, dir=RUNTIME_DIR)
+    capture_fd = None
+    dir_fd = None
     try:
         os.chmod(capture_dir, 0o700)
         st = os.lstat(capture_dir)
         if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
             raise OSError("capture dir not owned")
         target = os.path.join(capture_dir, "audio.wav")
-        return target, capture_dir
+        dir_fd = os.open(
+            capture_dir,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        capture_fd = os.open(
+            "audio.wav",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+            dir_fd=dir_fd,
+        )
+        info = os.fstat(capture_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise OSError("capture target is not a private regular file")
+        os.fchmod(capture_fd, 0o600)
+        os.close(dir_fd)
+        dir_fd = None
+        return target, capture_dir, capture_fd
     except Exception:
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
+        if capture_fd is not None:
+            try:
+                os.close(capture_fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(os.path.join(capture_dir, "audio.wav"))
+        except OSError:
+            pass
         try:
             os.rmdir(capture_dir)
         except OSError:
@@ -1793,8 +1875,9 @@ def _start_recording():
     # Create exclusive private capture target instead of predictable clear-then-open
     capture_target = None
     capture_dir = None
+    capture_fd = None
     try:
-        capture_target, capture_dir = _create_exclusive_capture_target()
+        capture_target, capture_dir, capture_fd = _create_exclusive_capture_target()
     except OSError as error:
         log(f"Could not create private capture target: {type(error).__name__}")
         pill_ipc("setStatus", "Recorder Error")
@@ -1811,16 +1894,19 @@ def _start_recording():
                 "-t", str(MAX_RECORDING_SECONDS),
                 "-fs", str(MAX_AUDIO_BYTES),
                 "-ar", "16000", "-ac", "1",
-                capture_target,
+                "-f", "wav", "-y", f"/proc/self/fd/{capture_fd}",
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
+            pass_fds=(capture_fd,),
             umask=0o077,
             env=_clean_env,
         )
+        os.close(capture_fd)
+        capture_fd = None
         time.sleep(0.05)
         if proc.poll() is not None:
             log(f"ffmpeg failed to start with exit code {proc.returncode}")
@@ -1840,6 +1926,11 @@ def _start_recording():
             return False
     except Exception as error:
         log(f"Failed to spawn ffmpeg: {type(error).__name__}")
+        if capture_fd is not None:
+            try:
+                os.close(capture_fd)
+            except OSError:
+                pass
         try:
             if capture_target and os.path.exists(capture_target):
                 _remove_owned_path(capture_target)
@@ -1855,17 +1946,9 @@ def _start_recording():
 
     try:
         _write_pid_markers(proc.pid)
-        # Mirror legacy only if capture_target is the expected TEMP_AUDIO; otherwise create hard link from capture to legacy if possible
-        # For exclusive capture, we maintain private capture and also optionally hard-link to TEMP_AUDIO for compatibility
-        try:
-            # Create a hard link at TEMP_AUDIO pointing to capture for legacy consumers that poll TEMP_AUDIO
-            # Use descriptor-relative unlink then link
-            _remove_owned_path(TEMP_AUDIO)
-            os.link(capture_target, TEMP_AUDIO)
-        except OSError:
-            # If linking fails, legacy path may remain absent; primary path is capture_target
-            pass
-        _mirror_legacy_audio()
+        # Keep the sensitive capture single-linked. Runtime state is the
+        # authoritative compatibility boundary; predictable hard-link mirrors
+        # would weaken the inode checks used before transcription.
         update_runtime_state("recording", paused=False, pid=proc.pid, audio_path=capture_target)
     except OSError as error:
         log(f"Failed to persist recording state: {type(error).__name__}")
@@ -2144,32 +2227,140 @@ def _transcribe_local(target_audio):
     return txt
 
 
-def _transcribe_cloud(target_audio, model_choice):
+def _bounded_transcript(text):
+    text = (text or "").strip()
+    if len(text) > MAX_TRANSCRIPT_CHARS:
+        text = text[:MAX_TRANSCRIPT_CHARS]
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_TRANSCRIPT_BYTES:
+        text = encoded[:MAX_TRANSCRIPT_BYTES].decode("utf-8", errors="ignore")
+    return text
+
+
+def _cloud_transcription_operation(
+    audio_bytes, model_choice, api_key, on_upload=None, on_cleanup_needed=None
+):
+    """Perform all SDK work inside the caller's cancellable process boundary."""
     from google import genai
     from google.genai import types
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=NETWORK_TIMEOUT_MS,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+    if model_choice == "gemini-3.5-transcribe":
+        audio_file = client.files.upload(
+            file=io.BytesIO(audio_bytes),
+            config=types.UploadFileConfig(mime_type="audio/wav"),
+        )
+        try:
+            if on_upload is not None:
+                on_upload(getattr(audio_file, "name", ""))
+            interaction = client.interactions.create(
+                model=model_choice,
+                input=[{
+                    "type": "audio", "uri": audio_file.uri,
+                    "mime_type": "audio/wav",
+                }],
+                generation_config={"transcription_config": {"mode": "smart"}},
+            )
+            return _bounded_transcript(getattr(interaction, "output_text", ""))
+        finally:
+            uploaded_name = getattr(audio_file, "name", "")
+            if uploaded_name:
+                try:
+                    client.files.delete(name=uploaded_name)
+                except Exception as error:
+                    log(f"Could not delete uploaded audio: {type(error).__name__}")
+                    if on_cleanup_needed is not None:
+                        on_cleanup_needed(uploaded_name)
+    response = client.models.generate_content(
+        model=model_choice,
+        contents=[
+            types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+            "Transcribe this speech accurately. Clean up disfluencies, remove filler words like ums/ahs, format punctuation and capitalization properly. Return ONLY the transcribed text without quotes or explanations.",
+        ],
+    )
+    return _bounded_transcript(response.text)
 
-    api_key = get_gemini_api_key()
+
+def _cloud_transcription_worker(connection, audio_bytes, model_choice, api_key):
+    try:
+        def report_upload(name):
+            if name:
+                connection.send_bytes(json.dumps({
+                    "event": "uploaded", "name": str(name)[:1024],
+                }, separators=(",", ":")).encode("utf-8"))
+
+        def report_cleanup_needed(name):
+            if name:
+                connection.send_bytes(json.dumps({
+                    "event": "cleanup_needed", "name": str(name)[:1024],
+                }, separators=(",", ":")).encode("utf-8"))
+
+        result = _cloud_transcription_operation(
+            audio_bytes, model_choice, api_key,
+            on_upload=report_upload,
+            on_cleanup_needed=report_cleanup_needed,
+        )
+        payload = json.dumps({"ok": True, "text": result}, separators=(",", ":")).encode("utf-8")
+    except BaseException as error:
+        payload = json.dumps({
+            "ok": False,
+            "error": type(error).__name__[:128],
+        }, separators=(",", ":")).encode("utf-8")
+    try:
+        connection.send_bytes(payload[:MAX_TRANSCRIPT_BYTES + 1024])
+    finally:
+        connection.close()
+
+
+def _cloud_delete_worker(name, api_key):
+    from google import genai
+    from google.genai import types
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=int(CLOUD_CLEANUP_RESERVE_SECONDS * 1000),
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+    client.files.delete(name=name)
+
+
+def _run_cloud_cleanup(context, name, api_key, deadline):
+    if not name or time.monotonic() >= deadline:
+        return False
+    cleanup = context.Process(target=_cloud_delete_worker, args=(name, api_key), daemon=True)
+    cleanup.start()
+    cleanup.join(max(0, deadline - time.monotonic()))
+    if cleanup.is_alive():
+        cleanup.kill()
+        cleanup.join(WATCHDOG_GRACE_KILL_SECONDS)
+        return False
+    return cleanup.exitcode == 0
+
+
+def _transcribe_cloud(target_audio, model_choice):
+    overall_deadline = time.monotonic() + TRANSCRIBE_DEADLINE_SECONDS
+    api_key = get_gemini_api_key(deadline=overall_deadline)
     if not api_key:
+        if time.monotonic() >= overall_deadline:
+            raise TimeoutError("transcription deadline exceeded")
         raise MissingApiKeyError
 
-    deadline = time.monotonic() + TRANSCRIBE_DEADLINE_SECONDS
-    def _check_deadline():
-        if time.monotonic() > deadline:
-            raise TimeoutError("transcription deadline exceeded")
-
-    # Descriptor-relative open with validation and O_NONBLOCK
     parent = os.path.dirname(target_audio) or "."
     base = os.path.basename(target_audio)
     dir_fd = None
     fd = None
     try:
-        dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
-        dir_fd = os.open(parent, dir_flags)
+        dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
         di = os.fstat(dir_fd)
         if not stat.S_ISDIR(di.st_mode) or di.st_uid != os.getuid():
             raise ValueError("audio directory is not private")
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-        fd = os.open(base, flags, dir_fd=dir_fd)
+        fd = os.open(base, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
             raise ValueError("audio file is not a private regular file")
@@ -2178,97 +2369,70 @@ def _transcribe_cloud(target_audio, model_choice):
         with os.fdopen(fd, "rb") as handle:
             fd = None
             audio_bytes = handle.read(MAX_AUDIO_BYTES + 1)
-            if len(audio_bytes) > MAX_AUDIO_BYTES:
-                raise ValueError("audio file exceeds application byte limit")
+        if len(audio_bytes) > MAX_AUDIO_BYTES:
+            raise ValueError("audio file exceeds application byte limit")
     finally:
         if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            os.close(fd)
         if dir_fd is not None:
-            try:
-                os.close(dir_fd)
-            except OSError:
-                pass
+            os.close(dir_fd)
 
-    _check_deadline()
-    client = genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(
-            timeout=NETWORK_TIMEOUT_MS,
-            retry_options=types.HttpRetryOptions(attempts=1),
-        ),
+    if time.monotonic() >= overall_deadline:
+        raise TimeoutError("transcription deadline exceeded")
+    context = multiprocessing.get_context("fork")
+    receive, send = context.Pipe(duplex=False)
+    worker = context.Process(
+        target=_cloud_transcription_worker,
+        args=(send, audio_bytes, model_choice, api_key),
+        daemon=True,
     )
+    worker.start()
+    send.close()
+    operation_deadline = overall_deadline - min(
+        CLOUD_CLEANUP_RESERVE_SECONDS, TRANSCRIBE_DEADLINE_SECONDS / 2
+    )
+    uploaded_name = ""
+    cleanup_needed = ""
+    result = None
+    try:
+        while time.monotonic() < operation_deadline:
+            remaining = operation_deadline - time.monotonic()
+            if not receive.poll(remaining):
+                break
+            payload = receive.recv_bytes(MAX_TRANSCRIPT_BYTES + 2048)
+            message = json.loads(payload.decode("utf-8"))
+            if message.get("event") == "uploaded":
+                uploaded_name = str(message.get("name", ""))[:1024]
+                continue
+            if message.get("event") == "cleanup_needed":
+                cleanup_needed = str(message.get("name", ""))[:1024]
+                continue
+            result = message
+            break
 
-    # Hard end-to-end deadline wrapper: enforce outer deadline even if SDK call blocks
-    def _bounded_call(fn, *args, **kwargs):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if result is None:
+            worker.terminate()
+            worker.join(WATCHDOG_GRACE_TERM_SECONDS)
+            if worker.is_alive():
+                worker.kill()
+                worker.join(WATCHDOG_GRACE_KILL_SECONDS)
+            _run_cloud_cleanup(context, uploaded_name, api_key, overall_deadline)
             raise TimeoutError("transcription deadline exceeded")
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(fn, *args, **kwargs)
-        try:
-            return future.result(timeout=remaining)
-        except concurrent.futures.TimeoutError as exc:
-            try:
-                future.cancel()
-            except Exception:
-                pass
-            raise TimeoutError("transcription deadline exceeded") from exc
-        finally:
-            try:
-                executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                # cancel_futures not available on older Python
-                executor.shutdown(wait=False)
-
-    if model_choice == "gemini-3.5-transcribe":
-        audio_file = _bounded_call(client.files.upload,
-            file=io.BytesIO(audio_bytes),
-            config=types.UploadFileConfig(mime_type="audio/wav"),
-        )
-        _check_deadline()
-        try:
-            interaction = _bounded_call(client.interactions.create,
-                model=model_choice,
-                input=[{
-                    "type": "audio", "uri": audio_file.uri,
-                    "mime_type": "audio/wav",
-                }],
-                generation_config={"transcription_config": {"mode": "smart"}},
-            )
-            txt = (getattr(interaction, "output_text", "") or "").strip()
-        finally:
-            uploaded_name = getattr(audio_file, "name", "")
-            if uploaded_name:
-                try:
-                    # Deletion also bounded but must not exceed deadline excessively
-                    client.files.delete(name=uploaded_name)
-                except Exception as error:
-                    log(f"Could not delete uploaded audio: {type(error).__name__}")
-        # Transcript ceiling
-        if len(txt) > MAX_TRANSCRIPT_CHARS:
-            txt = txt[:MAX_TRANSCRIPT_CHARS]
-        if len(txt.encode("utf-8")) > MAX_TRANSCRIPT_BYTES:
-            b = txt.encode("utf-8")[:MAX_TRANSCRIPT_BYTES]
-            txt = b.decode("utf-8", errors="ignore")
-        return txt
-    _check_deadline()
-    response = _bounded_call(client.models.generate_content,
-        model=model_choice,
-        contents=[
-            types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
-            "Transcribe this speech accurately. Clean up disfluencies, remove filler words like ums/ahs, format punctuation and capitalization properly. Return ONLY the transcribed text without quotes or explanations.",
-        ],
-    )
-    txt = (response.text or "").strip()
-    if len(txt) > MAX_TRANSCRIPT_CHARS:
-        txt = txt[:MAX_TRANSCRIPT_CHARS]
-    if len(txt.encode("utf-8")) > MAX_TRANSCRIPT_BYTES:
-        b = txt.encode("utf-8")[:MAX_TRANSCRIPT_BYTES]
-        txt = b.decode("utf-8", errors="ignore")
-    return txt
+        worker.join(WATCHDOG_GRACE_TERM_SECONDS)
+        if worker.is_alive():
+            worker.kill()
+            worker.join(WATCHDOG_GRACE_KILL_SECONDS)
+            raise TimeoutError("transcription worker did not exit")
+        if not result.get("ok"):
+            raise RuntimeError(f"cloud transcription failed: {result.get('error', 'unknown')}")
+        if cleanup_needed:
+            _run_cloud_cleanup(context, cleanup_needed, api_key, overall_deadline)
+        return _bounded_transcript(result.get("text", ""))
+    finally:
+        receive.close()
+        if worker.is_alive():
+            worker.kill()
+            worker.join(WATCHDOG_GRACE_KILL_SECONDS)
 
 
 def _transcribe_audio(target_audio, model_choice):
@@ -2452,6 +2616,45 @@ def toggle_recording(auto_submit=None):
         return _start_recording()
 
 
+def _run_qml_command(command, timeout=QML_JOB_TIMEOUT_SECONDS):
+    """Return bounded stdout for a QML child, or fail without partial JSON."""
+    try:
+        result = _run_captured(
+            command,
+            timeout=timeout,
+            max_output_bytes=MAX_QML_OUTPUT_BYTES,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _qml_gateway(action_args):
+    if not action_args:
+        return False
+    action = action_args[0]
+    if action in {"stop", "done", "transcribe", "submit", "send", "toggle", "toggle-submit"}:
+        timeout = 125
+    elif action in {"status", "model", "get-model", "settings", "get-settings", "list-models"}:
+        timeout = 2
+    elif action == "set-setting":
+        timeout = 4
+    elif action in {"apply-hotkeys", "remove-hotkeys", "migrate-hotkeys", "doctor"}:
+        timeout = 20
+    else:
+        timeout = 7
+    flowctl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flowctl")
+    output = _run_qml_command([flowctl_path, *action_args], timeout=timeout)
+    if output is None:
+        return False
+    if output:
+        sys.stdout.buffer.write(output)
+        sys.stdout.buffer.flush()
+    return True
+
+
 def _usage():
     return "Usage: gemini-dictate.py [start|stop|submit|pause|resume|cancel|toggle|toggle-submit|status|get-model|set-model <id>|list-models|settings|doctor|apply-hotkeys|remove-hotkeys|migrate-hotkeys]"
 
@@ -2459,7 +2662,9 @@ def _usage():
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "toggle"
 
-    if action == "start":
+    if action == "qml-gateway":
+        success = _qml_gateway(sys.argv[2:])
+    elif action == "start":
         success = start_recording()
     elif action in ("stop", "done", "transcribe"):
         success = stop_recording(auto_submit=False)

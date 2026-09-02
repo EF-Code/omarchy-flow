@@ -8,11 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- Harden captured helper execution to run in a new session with process-group `TERM -> bounded grace -> KILL` and close inherited pipe descriptors, preventing descendant leaks on timeout or output overflow.
+- Harden captured helper execution with process-group and pinned descendant `TERM -> bounded grace -> KILL`, reaping and pipe cleanup on timeout, output overflow, and exceptions.
 - Make private-file handling descriptor-relative (`O_NOFOLLOW`/`O_NONBLOCK` from held private directory, `fstat` owner/type/nlink checks, strict read ceilings, exclusive `renameat`, bounded log rotation and truncation).
-- Replace predictable `recording.wav` + `ffmpeg -y` with exclusively created private capture directory (`mkdtemp .cap-*`) and descriptor-validated audio discovery, avoiding same-UID swap between clear and open.
-- Enforce hard end-to-end transcription deadline (90 s) with `ThreadPoolExecutor` bounded SDK calls and strict transcript char/byte ceilings before clipboard/typing; suppress `wl-copy`/`wtype` output to `DEVNULL`.
-- Add per-job QML watchdogs, `Component.onDestruction` cleanup, bounded JSON parsing/cardinality and `Text.PlainText` for externally derived strings (SettingsView conflicts/diagnostics, BarWidget/Pill/FlowDropdown).
+- Replace predictable `recording.wav` reopening with an exclusively created, descriptor-validated inode passed to ffmpeg through `/proc/self/fd`, preserving a seekable finalized WAV without a mutable target race.
+- Enforce a hard end-to-end cloud transcription deadline (including credential lookup, upload, generation, and cleanup) in a killable worker process, retry failed upload cleanup within the deadline, cap transcript char/bytes, and suppress `wl-copy`/`wtype` output.
+- Route every QML collector producer through a `16 KiB` output-capped gateway with action-specific deadlines, add matching per-job watchdogs and destruction cleanup, bound JSON parsing/cardinality, and use `Text.PlainText` for externally derived strings.
 - Rate-limit log writes and rotate logs, scrub additional `LD_*`/`PYTHON*` env vars in `pill_ipc`, and harden `flowctl` audio test capture.
 
 ## [0.4.0] - 2026-08-30

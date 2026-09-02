@@ -42,7 +42,7 @@ Item {
     // Load saved model on startup
     Process {
         id: loadModelProcess
-        command: [root.flowctlPath, "model"]
+        command: [root.flowctlPath, "qml", "model"]
         running: true
         stdout: SplitParser {
             onRead: function(data) {
@@ -69,7 +69,7 @@ Item {
         function save(modelId: string): string {
             if (running) return "busy"
             var safe = root.sanitizedModelId(modelId)
-            command = [root.flowctlPath, "model", safe]
+            command = [root.flowctlPath, "qml", "model", safe]
             running = true
             return "ok"
         }
@@ -84,7 +84,7 @@ Item {
 
     Process {
         id: loadSettingsProcess
-        command: [root.flowctlPath, "settings"]
+        command: [root.flowctlPath, "qml", "settings"]
         running: true
         stdout: StdioCollector {
             id: settingsOutput
@@ -220,28 +220,28 @@ Item {
     // Process runners for button clicks and actions
     Process {
         id: pauseProcess
-        command: [root.flowctlPath, "pause"]
+        command: [root.flowctlPath, "qml", "pause"]
         Component.onDestruction: if (running) running = false
     }
     Timer { interval: 8000; running: pauseProcess.running; onTriggered: pauseProcess.running = false }
     Process {
         id: transcribeProcess
-        command: [root.flowctlPath, "stop"]
+        command: [root.flowctlPath, "qml", "stop"]
         Component.onDestruction: if (running) running = false
     }
-    Timer { interval: 15000; running: transcribeProcess.running; onTriggered: transcribeProcess.running = false }
+    Timer { interval: 130000; running: transcribeProcess.running; onTriggered: transcribeProcess.running = false }
     Process {
         id: cancelProcess
-        command: [root.flowctlPath, "cancel"]
+        command: [root.flowctlPath, "qml", "cancel"]
         Component.onDestruction: if (running) running = false
     }
     Timer { interval: 8000; running: cancelProcess.running; onTriggered: cancelProcess.running = false }
     Process {
         id: toggleProcess
-        command: [root.flowctlPath, "toggle"]
+        command: [root.flowctlPath, "qml", "toggle"]
         Component.onDestruction: if (running) running = false
     }
-    Timer { interval: 10000; running: toggleProcess.running; onTriggered: toggleProcess.running = false }
+    Timer { interval: 130000; running: toggleProcess.running; onTriggered: toggleProcess.running = false }
 
     PanelWindow {
         id: panel

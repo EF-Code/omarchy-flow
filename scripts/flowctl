@@ -29,6 +29,17 @@ fi
 
 ACTION="${1:-toggle}"
 
+# Quickshell collectors do not expose a native byte ceiling. Route every QML
+# call through the backend's process-group-aware producer boundary.
+if [[ "$ACTION" == "qml" ]]; then
+  shift
+  if [[ $# -lt 1 ]]; then
+    echo "Error: qml requires a Flow command." >&2
+    exit 1
+  fi
+  exec "$PYTHON_BIN" "$BACKEND_PY" qml-gateway "$@" 2>/dev/null
+fi
+
 case "$ACTION" in
   toggle|toggle-submit|start|stop|done|transcribe|submit|send|pause|toggle-pause|resume|cancel|status|list-models|settings|get-settings|reset-settings|remove-hotkeys|migrate-hotkeys|list-audio-sources|hotkeys-status|doctor|test-audio)
     if [[ $# -gt 1 ]]; then

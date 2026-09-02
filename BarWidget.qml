@@ -30,7 +30,7 @@ BarWidget {
 
   function runAction(action, extraArg) {
     if (actionProcess.running) return false
-    var cmd = [root.flowctlPath, action]
+    var cmd = [root.flowctlPath, "qml", action]
     if (extraArg !== undefined && extraArg !== null && String(extraArg).trim() !== "") {
       cmd.push(String(extraArg))
     }
@@ -97,14 +97,14 @@ BarWidget {
 
   Timer {
     id: actionWatchdog
-    interval: 10000
+    interval: 130000
     running: actionProcess.running
     onTriggered: actionProcess.running = false
   }
 
   Process {
     id: statusProcess
-    command: [root.flowctlPath, "status"]
+    command: [root.flowctlPath, "qml", "status"]
     stdout: StdioCollector {
       id: statusOut
       waitForEnd: true

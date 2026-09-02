@@ -4,10 +4,12 @@
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import warnings
 from pathlib import Path
@@ -30,6 +32,14 @@ spec.loader.exec_module(backend)
 
 def file_mode(path):
     return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def process_is_running(pid):
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        return state != "Z"
+    except (OSError, IndexError):
+        return False
 
 
 class TestFlowBackend(unittest.TestCase):
@@ -403,6 +413,17 @@ class TestFlowBackend(unittest.TestCase):
     def test_is_recording_rejects_stale_and_pid_reuse_markers(self):
         Path(backend.PID_FILE).write_text("9999999\n")
         self.assertFalse(backend.is_recording())
+
+    def test_recorder_identity_accepts_held_fd_output_shape(self):
+        command = [
+            "ffmpeg", "-loglevel", "error", "-f", "pulse", "-i", "default",
+            "-t", "600", "-fs", "20971520", "-ar", "16000", "-ac", "1",
+            "-f", "wav", "-y", "/proc/self/fd/7",
+        ]
+        with patch.object(backend, "_process_alive", return_value=True), patch.object(
+            backend.os, "stat", return_value=SimpleNamespace(st_uid=os.getuid())
+        ), patch.object(backend, "_process_cmdline", return_value=command):
+            self.assertTrue(backend._is_recorder_process(4242))
         self.assertFalse(Path(backend.PID_FILE).exists())
 
         Path(backend.PID_FILE).write_text(f"{os.getpid()}\n")
@@ -506,8 +527,6 @@ class TestFlowBackend(unittest.TestCase):
                 backend._transcribe_local("recording.wav")
 
     def test_dedicated_cloud_transcription_uses_file_upload(self):
-        audio = Path(backend.TEMP_AUDIO)
-        audio.write_bytes(b"RIFF test")
         interaction = SimpleNamespace(output_text="  Cloud result  ")
         uploaded = {}
         with warnings.catch_warnings():
@@ -524,7 +543,9 @@ class TestFlowBackend(unittest.TestCase):
                     )
                 client.files.upload.side_effect = upload
                 client.interactions.create.return_value = interaction
-                result = backend._transcribe_cloud(str(audio), "gemini-3.5-transcribe")
+                result = backend._cloud_transcription_operation(
+                    b"RIFF test", "gemini-3.5-transcribe", "api-key-123456789"
+                )
 
         self.assertEqual(result, "Cloud result")
         upload_call = client.files.upload.call_args
@@ -574,6 +595,118 @@ class TestFlowBackend(unittest.TestCase):
                 ]
                 with self.assertRaises(backend.CapturedOutputLimitError):
                     backend._run_captured(command, timeout=2, max_output_bytes=1024)
+
+    def test_captured_timeout_kills_descendants_after_leader_exits(self):
+        pid_file = Path(self.temp_dir.name) / "descendant.pid"
+        command = [
+            "bash", "-c",
+            f'trap "" TERM; sleep 30 & echo $! > "{pid_file}"; exit 0',
+        ]
+        with self.assertRaises(subprocess.TimeoutExpired):
+            backend._run_captured(command, timeout=0.2, max_output_bytes=1024)
+        descendant = int(pid_file.read_text())
+        deadline = time.monotonic() + 1
+        while process_is_running(descendant) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(process_is_running(descendant))
+
+    def test_captured_timeout_kills_descendant_in_nested_session(self):
+        pid_file = Path(self.temp_dir.name) / "nested-session.pid"
+        command = [
+            sys.executable, "-c",
+            "import pathlib,subprocess,time; "
+            f"p=subprocess.Popen(['sleep','30'],start_new_session=True); pathlib.Path({str(pid_file)!r}).write_text(str(p.pid)); "
+            "time.sleep(30)",
+        ]
+        with self.assertRaises(subprocess.TimeoutExpired):
+            backend._run_captured(command, timeout=0.3, max_output_bytes=1024)
+        descendant = int(pid_file.read_text())
+        self.assertFalse(process_is_running(descendant))
+
+    def test_cloud_deadline_kills_blocked_worker(self):
+        audio = Path(backend.TEMP_AUDIO)
+        audio.write_bytes(b"R" * 1200)
+        pid_file = Path(self.temp_dir.name) / "cloud-worker.pid"
+
+        def blocked_worker(connection, audio_bytes, model_choice, api_key):
+            pid_file.write_text(str(os.getpid()))
+            time.sleep(30)
+
+        with patch.object(backend, "get_gemini_api_key", return_value="api-key"), patch.object(
+            backend, "TRANSCRIBE_DEADLINE_SECONDS", 0.2
+        ), patch.object(backend, "_cloud_transcription_worker", blocked_worker):
+            started = time.monotonic()
+            with self.assertRaisesRegex(TimeoutError, "deadline"):
+                backend._transcribe_cloud(str(audio), "gemini-3.5-transcribe")
+            self.assertLess(time.monotonic() - started, 1.5)
+
+        worker_pid = int(pid_file.read_text())
+        self.assertFalse(process_is_running(worker_pid))
+
+    def test_cloud_timeout_after_upload_attempts_bounded_cleanup(self):
+        audio = Path(backend.TEMP_AUDIO)
+        audio.write_bytes(b"R" * 1200)
+        cleanup_marker = Path(self.temp_dir.name) / "cleanup-name"
+
+        def uploaded_then_blocked(connection, audio_bytes, model_choice, api_key):
+            connection.send_bytes(json.dumps({
+                "event": "uploaded", "name": "uploaded-audio",
+            }).encode())
+            time.sleep(30)
+
+        def record_cleanup(name, api_key):
+            cleanup_marker.write_text(name)
+
+        with patch.object(backend, "get_gemini_api_key", return_value="api-key"), patch.object(
+            backend, "TRANSCRIBE_DEADLINE_SECONDS", 0.4
+        ), patch.object(backend, "CLOUD_CLEANUP_RESERVE_SECONDS", 0.2), patch.object(
+            backend, "_cloud_transcription_worker", uploaded_then_blocked
+        ), patch.object(backend, "_cloud_delete_worker", record_cleanup):
+            with self.assertRaisesRegex(TimeoutError, "deadline"):
+                backend._transcribe_cloud(str(audio), "gemini-3.5-transcribe")
+
+        self.assertEqual(cleanup_marker.read_text(), "uploaded-audio")
+
+    def test_cloud_deadline_includes_key_lookup(self):
+        audio = Path(backend.TEMP_AUDIO)
+        audio.write_bytes(b"R" * 1200)
+
+        def slow_key_lookup(deadline=None):
+            time.sleep(0.15)
+            return "api-key"
+
+        with patch.object(backend, "get_gemini_api_key", side_effect=slow_key_lookup), patch.object(
+            backend, "TRANSCRIBE_DEADLINE_SECONDS", 0.1
+        ):
+            started = time.monotonic()
+            with self.assertRaisesRegex(TimeoutError, "deadline"):
+                backend._transcribe_cloud(str(audio), "gemini-3.5-transcribe")
+            self.assertLess(time.monotonic() - started, 0.3)
+
+    def test_cloud_cleanup_failure_is_retried_by_parent(self):
+        audio = Path(backend.TEMP_AUDIO)
+        audio.write_bytes(b"R" * 1200)
+        cleanup_marker = Path(self.temp_dir.name) / "cleanup-retry"
+
+        def completed_with_cleanup_needed(connection, audio_bytes, model_choice, api_key):
+            connection.send_bytes(json.dumps({
+                "event": "cleanup_needed", "name": "uploaded-audio",
+            }).encode())
+            connection.send_bytes(json.dumps({"ok": True, "text": "hello"}).encode())
+            connection.close()
+
+        def record_cleanup(name, api_key):
+            cleanup_marker.write_text(name)
+
+        with patch.object(backend, "get_gemini_api_key", return_value="api-key"), patch.object(
+            backend, "TRANSCRIBE_DEADLINE_SECONDS", 1
+        ), patch.object(
+            backend, "_cloud_transcription_worker", completed_with_cleanup_needed
+        ), patch.object(backend, "_cloud_delete_worker", record_cleanup):
+            self.assertEqual(
+                backend._transcribe_cloud(str(audio), "gemini-3.5-transcribe"), "hello"
+            )
+        self.assertEqual(cleanup_marker.read_text(), "uploaded-audio")
 
     def test_transcribing_status_does_not_expose_model_name(self):
         Path(backend.TEMP_AUDIO).write_bytes(b"R" * 1200)
@@ -668,11 +801,58 @@ class TestFlowBackend(unittest.TestCase):
         )
         self.assertEqual(command[command.index("-t") + 1], str(backend.MAX_RECORDING_SECONDS))
         self.assertEqual(command[command.index("-fs") + 1], str(backend.MAX_AUDIO_BYTES))
+        self.assertNotIn(data_path := json.loads(Path(backend.STATE_FILE).read_text())["audio_path"], command)
+        self.assertTrue(Path(data_path).is_file())
+        self.assertEqual(command[-4:-1], ["-f", "wav", "-y"])
+        self.assertTrue(command[-1].startswith("/proc/self/fd/"))
+        self.assertEqual(tuple(popen.call_args.kwargs["pass_fds"]), (int(command[-1].rsplit("/", 1)[1]),))
         self.assertEqual(popen.call_args.kwargs["umask"], 0o077)
         self.assertEqual(file_mode(backend.PID_FILE), 0o600)
         data = json.loads(Path(backend.STATE_FILE).read_text())
         self.assertEqual(data["pid"], 4242)
         self.assertEqual(data["start_ticks"], 1234)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg required")
+    def test_held_recording_fd_produces_decodable_wav(self):
+        target, _capture_dir, capture_fd = backend._create_exclusive_capture_target()
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=0.05",
+                    "-ar", "16000", "-ac", "1", "-f", "wav", "-y",
+                    f"/proc/self/fd/{capture_fd}",
+                ],
+                pass_fds=(capture_fd,), capture_output=True,
+            )
+        finally:
+            os.close(capture_fd)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_name", "-of", "json", target],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertEqual(json.loads(probe.stdout)["streams"][0]["codec_name"], "pcm_s16le")
+        import wave
+        with wave.open(target, "rb") as wav:
+            self.assertEqual(wav.getframerate(), 16000)
+            self.assertEqual(wav.getnchannels(), 1)
+            self.assertGreater(wav.getnframes(), 0)
+            self.assertLess(wav.getnframes(), 16000)
+
+    def test_audio_test_uses_the_held_capture_inode(self):
+        def fake_run(command, **kwargs):
+            inherited_fd = kwargs["pass_fds"][0]
+            self.assertEqual(command[-1], f"/proc/self/fd/{inherited_fd}")
+            self.assertEqual(command[-2], "-y")
+            os.write(inherited_fd, b"R" * 1200)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with patch.object(backend.shutil, "which", return_value="/usr/bin/ffmpeg"), patch.object(
+            backend, "_run_captured", side_effect=fake_run
+        ):
+            self.assertTrue(backend.run_audio_test()["ok"])
 
     def test_start_recording_rejects_low_free_space_before_spawning(self):
         usage = SimpleNamespace(free=backend.MAX_AUDIO_BYTES)
@@ -695,10 +875,56 @@ class TestFlowBackend(unittest.TestCase):
         self.assertIn('if (root.stateMode === "status") return root.statusText', pill)
         self.assertIn("property var actionQueue", service)
         self.assertIn('return "queued"', service)
-        self.assertIn('command: [root.flowctlPath, "migrate-hotkeys"]', service)
+        self.assertIn('command: [root.flowctlPath, "qml", "migrate-hotkeys"]', service)
         self.assertIn("property var settingWriteQueue", settings)
         self.assertIn("root.settingWriteQueue.push(command)", settings)
-        self.assertIn('command: [root.flowctlPath, "remove-hotkeys"]', settings)
+        self.assertIn('command: [root.flowctlPath, "qml", "remove-hotkeys"]', settings)
+        for source in [bar, pill, service, settings]:
+            self.assertIn('root.flowctlPath, "qml"', source)
+
+    def test_qml_flowctl_caps_producer_output(self):
+        noisy = [
+            sys.executable, "-c",
+            "import sys; sys.stdout.buffer.write(b'x'*100000); "
+            "sys.stderr.buffer.write(b'y'*100000)",
+        ]
+        self.assertIsNone(backend._run_qml_command(noisy))
+        bounded = backend._run_qml_command(
+            [sys.executable, "-c", "print('{\\\"ok\\\":true}')"]
+        )
+        self.assertEqual(bounded, b'{"ok":true}\n')
+
+        result = subprocess.run(
+            [str(REPO_ROOT / "scripts" / "flowctl"), "qml", "status"],
+            env=self.child_env, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertLessEqual(len(result.stdout), backend.MAX_QML_OUTPUT_BYTES)
+        self.assertEqual(result.stderr, b"")
+        self.assertIn("recording", json.loads(result.stdout))
+        model = subprocess.run(
+            [str(REPO_ROOT / "scripts" / "flowctl"), "qml", "model"],
+            env=self.child_env, capture_output=True, text=True,
+        )
+        self.assertEqual(model.returncode, 0, model.stderr)
+        self.assertEqual(model.stdout.strip(), backend.DEFAULT_MODEL_ID)
+
+    def test_qml_gateway_deadlines_cover_legitimate_actions(self):
+        seen = []
+
+        def capture(command, timeout):
+            seen.append((command[-1], timeout))
+            return b""
+
+        with patch.object(backend, "_run_qml_command", side_effect=capture):
+            for action in ("stop", "apply-hotkeys", "migrate-hotkeys", "status"):
+                self.assertTrue(backend._qml_gateway([action]))
+        self.assertEqual(dict(seen), {
+            "stop": 125,
+            "apply-hotkeys": 20,
+            "migrate-hotkeys": 20,
+            "status": 2,
+        })
 
     def test_release_version_is_synchronised(self):
         manifest = json.loads((REPO_ROOT / "manifest.json").read_text())

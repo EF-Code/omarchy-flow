@@ -15,7 +15,7 @@ Item {
   }
 
   function runAction(action, extraArg) {
-    var cmd = [root.flowctlPath, action]
+    var cmd = [root.flowctlPath, "qml", action]
     if (extraArg !== undefined && extraArg !== null && String(extraArg).trim() !== "") {
       cmd.push(String(extraArg))
     }
@@ -40,7 +40,7 @@ Item {
 
   Timer {
     id: actionWatchdog
-    interval: 10000
+    interval: 130000
     running: actionProcess.running
     onTriggered: actionProcess.running = false
   }
@@ -49,13 +49,13 @@ Item {
   // shortcuts for users who have not opted into them.
   Process {
     id: migrateProcess
-    command: [root.flowctlPath, "migrate-hotkeys"]
+    command: [root.flowctlPath, "qml", "migrate-hotkeys"]
     running: true
     Component.onDestruction: if (running) running = false
   }
 
   Timer {
-    interval: 5000
+    interval: 25000
     running: migrateProcess.running
     onTriggered: migrateProcess.running = false
   }
