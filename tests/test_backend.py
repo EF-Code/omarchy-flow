@@ -143,6 +143,14 @@ class TestFlowBackend(unittest.TestCase):
         self.assertEqual(sys.path[0], "/active-env/lib/python3.14/site-packages")
         sys.path[:] = original_path
 
+    def test_private_directory_rejects_foreign_owner(self):
+        foreign = SimpleNamespace(st_mode=stat.S_IFDIR | 0o777, st_uid=os.getuid() + 1)
+        with patch.object(backend.os, "lstat", return_value=foreign), patch.object(
+            backend.os, "makedirs"
+        ):
+            with self.assertRaisesRegex(OSError, "not owned"):
+                backend._ensure_private_dir("/tmp/foreign-runtime")
+
     def test_get_and_set_selected_model(self):
         self.assertEqual(backend.get_selected_model(), "whisper-base.en")
         self.assertTrue(backend.set_selected_model("gemini-3.5-transcribe"))
@@ -196,7 +204,7 @@ class TestFlowBackend(unittest.TestCase):
             },
         ])
         result = subprocess.CompletedProcess(args=[], returncode=0, stdout=pactl_output, stderr="")
-        with patch("subprocess.run", return_value=result):
+        with patch.object(backend, "_run_captured", return_value=result):
             sources = backend.list_audio_sources()
         self.assertEqual(sources, [
             {"id": "default", "name": "System default"},
@@ -220,8 +228,8 @@ class TestFlowBackend(unittest.TestCase):
         model_list = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="Installed Whisper Models\n\n  tiny.en (75 MB)\n"
         )
-        with patch.object(backend.shutil, "which", return_value="/usr/bin/tool"), patch(
-            "subprocess.run", return_value=model_list
+        with patch.object(backend.shutil, "which", return_value="/usr/bin/tool"), patch.object(
+            backend, "_run_captured", return_value=model_list
         ), patch.object(
             backend, "list_audio_sources", return_value=[{"id": "default", "name": "System default"}]
         ):
@@ -233,8 +241,8 @@ class TestFlowBackend(unittest.TestCase):
         self.assertFalse(report["ok"])
 
         model_list.stdout += "  base.en (141 MB) - Good balance\n"
-        with patch.object(backend.shutil, "which", return_value="/usr/bin/tool"), patch(
-            "subprocess.run", return_value=model_list
+        with patch.object(backend.shutil, "which", return_value="/usr/bin/tool"), patch.object(
+            backend, "_run_captured", return_value=model_list
         ), patch.object(
             backend, "list_audio_sources", return_value=[{"id": "default", "name": "System default"}]
         ):
@@ -260,7 +268,7 @@ class TestFlowBackend(unittest.TestCase):
                 return reload_ok
             raise AssertionError(f"unexpected subprocess call: {args}")
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch.object(backend, "_run_captured", side_effect=fake_run):
             self.assertTrue(backend.apply_hotkeys({
                 "toggle": "SUPER + ALT + F6",
                 "toggle_submit": "",
@@ -290,7 +298,7 @@ class TestFlowBackend(unittest.TestCase):
         self.assertTrue(backend.set_setting("copy_to_clipboard", "false"))
         self.assertTrue(backend.set_setting("hud_enabled", "false"))
 
-        with patch("subprocess.run", return_value=reload_ok):
+        with patch.object(backend, "_run_captured", return_value=reload_ok):
             self.assertTrue(backend.apply_hotkeys({"toggle": "SUPER + ALT + F6"}))
             self.assertTrue(backend.reset_settings())
 
@@ -306,7 +314,7 @@ class TestFlowBackend(unittest.TestCase):
         )
         reload_ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
 
-        with patch("subprocess.run", return_value=reload_ok):
+        with patch.object(backend, "_run_captured", return_value=reload_ok):
             self.assertTrue(backend.remove_hotkeys())
 
         content = bindings_path.read_text()
@@ -328,7 +336,7 @@ class TestFlowBackend(unittest.TestCase):
         )
         reload_ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
 
-        with patch("subprocess.run", return_value=reload_ok):
+        with patch.object(backend, "_run_captured", return_value=reload_ok):
             self.assertTrue(backend.migrate_hotkeys())
 
         content = bindings_path.read_text()
@@ -381,14 +389,14 @@ class TestFlowBackend(unittest.TestCase):
         failed_lookup = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr=""
         )
-        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}), patch(
-            "subprocess.run", return_value=failed_lookup
+        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}), patch.object(
+            backend, "_run_captured", return_value=failed_lookup
         ):
             self.assertEqual(backend.get_gemini_api_key(), "test_file_key_987654321")
 
         os.chmod(key_file, 0o644)
-        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}), patch(
-            "subprocess.run", return_value=failed_lookup
+        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}), patch.object(
+            backend, "_run_captured", return_value=failed_lookup
         ):
             self.assertIsNone(backend.get_gemini_api_key())
 
@@ -484,7 +492,7 @@ class TestFlowBackend(unittest.TestCase):
         success = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="Transcription completed in 0.1s\nHello"
         )
-        with patch("subprocess.run", return_value=success) as run:
+        with patch.object(backend, "_run_captured", return_value=success) as run:
             self.assertEqual(backend._transcribe_local("recording.wav"), "Hello")
         self.assertEqual(
             run.call_args.args[0],
@@ -493,7 +501,7 @@ class TestFlowBackend(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 120)
 
         failure = subprocess.CompletedProcess(args=[], returncode=1, stdout="")
-        with patch("subprocess.run", return_value=failure):
+        with patch.object(backend, "_run_captured", return_value=failure):
             with self.assertRaises(RuntimeError):
                 backend._transcribe_local("recording.wav")
 
@@ -501,22 +509,35 @@ class TestFlowBackend(unittest.TestCase):
         audio = Path(backend.TEMP_AUDIO)
         audio.write_bytes(b"RIFF test")
         interaction = SimpleNamespace(output_text="  Cloud result  ")
+        uploaded = {}
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             with patch.object(
                 backend, "get_gemini_api_key", return_value="api-key-123456789"
             ), patch("google.genai.Client") as client_type:
                 client = client_type.return_value
-                client.files.upload.return_value = SimpleNamespace(
-                    name="uploaded-audio", uri="https://example.invalid/audio", mime_type="audio/wav"
-                )
+                def upload(file, config):
+                    uploaded["bytes"] = file.read()
+                    return SimpleNamespace(
+                        name="uploaded-audio", uri="https://example.invalid/audio",
+                        mime_type="audio/wav",
+                    )
+                client.files.upload.side_effect = upload
                 client.interactions.create.return_value = interaction
                 result = backend._transcribe_cloud(str(audio), "gemini-3.5-transcribe")
 
         self.assertEqual(result, "Cloud result")
         upload_call = client.files.upload.call_args
-        self.assertEqual(upload_call.kwargs["file"], str(audio))
+        self.assertEqual(uploaded["bytes"], b"RIFF test")
         self.assertEqual(upload_call.kwargs["config"].mime_type, "audio/wav")
+        self.assertEqual(
+            client_type.call_args.kwargs["http_options"].timeout,
+            backend.NETWORK_TIMEOUT_MS,
+        )
+        self.assertEqual(
+            client_type.call_args.kwargs["http_options"].retry_options.attempts,
+            1,
+        )
         client.files.delete.assert_called_once_with(name="uploaded-audio")
         call = client.interactions.create.call_args
         self.assertEqual(call.kwargs["model"], "gemini-3.5-transcribe")
@@ -533,6 +554,27 @@ class TestFlowBackend(unittest.TestCase):
         with self.assertRaises(ValueError):
             backend._transcribe_audio("recording.wav", "unsupported-model")
 
+    def test_cloud_transcription_rejects_oversized_audio_before_upload(self):
+        audio = Path(backend.TEMP_AUDIO)
+        with audio.open("wb") as handle:
+            handle.truncate(backend.MAX_AUDIO_BYTES + 1)
+        with patch.object(
+            backend, "get_gemini_api_key", return_value="api-key-123456789"
+        ), patch("google.genai.Client") as client_type:
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                backend._transcribe_cloud(str(audio), "gemini-3.5-transcribe")
+        client_type.return_value.files.upload.assert_not_called()
+
+    def test_captured_output_limit_stops_the_producer(self):
+        for stream in ["stdout", "stderr"]:
+            with self.subTest(stream=stream):
+                command = [
+                    sys.executable, "-c",
+                    f"import sys; sys.{stream}.buffer.write(b'x' * 8192)",
+                ]
+                with self.assertRaises(backend.CapturedOutputLimitError):
+                    backend._run_captured(command, timeout=2, max_output_bytes=1024)
+
     def test_transcribing_status_does_not_expose_model_name(self):
         Path(backend.TEMP_AUDIO).write_bytes(b"R" * 1200)
         with patch.object(backend, "_terminate_recorder", return_value=True), patch.object(
@@ -546,6 +588,36 @@ class TestFlowBackend(unittest.TestCase):
         self.assertFalse(
             any("gemini-3.5-transcribe" in str(call.args) for call in ipc.call_args_list)
         )
+
+    def test_stop_rejects_oversized_audio_before_any_transcriber(self):
+        with Path(backend.TEMP_AUDIO).open("wb") as handle:
+            handle.truncate(backend.MAX_AUDIO_BYTES + 1)
+        with patch.object(backend, "_terminate_recorder", return_value=True), patch.object(
+            backend, "_transcribe_audio"
+        ) as transcribe, patch.object(backend, "pill_ipc") as ipc:
+            self.assertFalse(backend._stop_recording(pids=[4242]))
+        transcribe.assert_not_called()
+        ipc.assert_any_call("setStatus", "Audio too long")
+
+    def test_stop_transcribes_audio_after_capped_recorder_exits(self):
+        Path(backend.TEMP_AUDIO).write_bytes(b"R" * 1200)
+        backend.update_runtime_state("recording", paused=False, pid=4242)
+        with patch.object(backend, "_process_alive", return_value=False), patch.object(
+            backend, "_transcribe_audio", return_value="completed text"
+        ) as transcribe, patch.object(
+            backend, "_inject_text", return_value=True
+        ), patch.object(backend, "pill_ipc"):
+            self.assertTrue(backend._stop_recording())
+        transcribe.assert_called_once_with(backend.TEMP_AUDIO, backend.DEFAULT_MODEL_ID)
+        self.assertFalse(Path(backend.TEMP_AUDIO).exists())
+
+    def test_status_poll_preserves_completed_capped_recording(self):
+        Path(backend.TEMP_AUDIO).write_bytes(b"R" * 1200)
+        backend.update_runtime_state("recording", paused=False, pid=4242)
+        with patch.object(backend, "_process_alive", return_value=False):
+            self.assertFalse(backend.is_recording())
+        self.assertTrue(Path(backend.STATE_FILE).exists())
+        self.assertTrue(backend._completed_recording_available())
 
     def test_inject_text_checks_keyboard_commands(self):
         calls = []
@@ -561,11 +633,13 @@ class TestFlowBackend(unittest.TestCase):
             [call[0] for call in calls],
             [
                 ["wl-copy", "--sensitive"],
-                ["wtype", "--", "hello"],
+                ["wtype", "-"],
                 ["wtype", "-k", "Return"],
             ],
         )
         self.assertEqual(calls[0][1]["input"], "hello")
+        self.assertEqual(calls[1][1]["input"], "hello")
+        self.assertNotIn("hello", calls[1][0])
 
         def wtype_failure(args, **kwargs):
             code = 1 if args[0] == "wtype" else 0
@@ -592,11 +666,22 @@ class TestFlowBackend(unittest.TestCase):
             command[command.index("-f") : command.index("-f") + 4],
             ["-f", "pulse", "-i", "default"],
         )
+        self.assertEqual(command[command.index("-t") + 1], str(backend.MAX_RECORDING_SECONDS))
+        self.assertEqual(command[command.index("-fs") + 1], str(backend.MAX_AUDIO_BYTES))
         self.assertEqual(popen.call_args.kwargs["umask"], 0o077)
         self.assertEqual(file_mode(backend.PID_FILE), 0o600)
         data = json.loads(Path(backend.STATE_FILE).read_text())
         self.assertEqual(data["pid"], 4242)
         self.assertEqual(data["start_ticks"], 1234)
+
+    def test_start_recording_rejects_low_free_space_before_spawning(self):
+        usage = SimpleNamespace(free=backend.MAX_AUDIO_BYTES)
+        with patch.object(backend, "is_recording", return_value=False), patch.object(
+            backend.shutil, "disk_usage", return_value=usage
+        ), patch("subprocess.Popen") as popen, patch.object(backend, "pill_ipc") as ipc:
+            self.assertFalse(backend.start_recording())
+        popen.assert_not_called()
+        ipc.assert_any_call("setStatus", "Storage Full")
 
     def test_qml_action_and_status_contracts(self):
         bar = (REPO_ROOT / "BarWidget.qml").read_text()

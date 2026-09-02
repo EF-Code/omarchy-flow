@@ -22,6 +22,8 @@ import tempfile
 import warnings
 import shutil
 import importlib.util
+import selectors
+import io
 
 # Dynamically discover and include virtual environment site-packages (e.g. ~/.venv)
 def _ensure_venv_packages():
@@ -73,11 +75,10 @@ def _ensure_private_dir(path):
     if os.path.islink(path):
         raise OSError(f"refusing symlink directory: {path}")
     os.makedirs(path, mode=0o700, exist_ok=True)
-    try:
-        if os.stat(path).st_uid == os.getuid():
-            os.chmod(path, 0o700)
-    except OSError:
-        pass
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise OSError(f"private directory is not owned by current user: {path}")
+    os.chmod(path, 0o700)
 
 
 # XDG Standard Directories
@@ -118,6 +119,14 @@ SUPPORTED_MODELS = [
 DEFAULT_MODEL_ID = SUPPORTED_MODELS[0]["id"]
 SUPPORTED_MODEL_IDS = frozenset(model["id"] for model in SUPPORTED_MODELS)
 
+# Application-owned resource ceilings. Ten minutes of 16 kHz mono PCM is
+# about 19.2 MB, leaving room for the WAV header inside the byte ceiling.
+MAX_RECORDING_SECONDS = 600
+MAX_AUDIO_BYTES = 20 * 1024 * 1024
+MIN_FREE_SPACE_BYTES = 64 * 1024 * 1024
+NETWORK_TIMEOUT_MS = 60_000
+MAX_CAPTURED_OUTPUT_BYTES = 1024 * 1024
+
 DEFAULT_SETTINGS = {
     "toggle_action": "transcribe",
     "audio_source": "default",
@@ -155,13 +164,68 @@ HOTKEY_IDS = (
 HOTKEY_MARKER_START = "-- >>> omarchy-flow managed hotkeys >>>"
 HOTKEY_MARKER_END = "-- <<< omarchy-flow managed hotkeys <<<"
 
-for directory in [CONFIG_DIR, RUNTIME_DIR, STATE_DIR]:
+for directory in [XDG_RUNTIME_DIR, CONFIG_DIR, RUNTIME_DIR, STATE_DIR]:
     try:
         _ensure_private_dir(directory)
     except OSError:
         # Individual operations report failures through their normal error
         # paths. Importing the module must remain safe in a read-only setup.
         pass
+
+
+class CapturedOutputLimitError(subprocess.SubprocessError):
+    """Raised after stopping a child that exceeds a captured-output ceiling."""
+
+
+def _run_captured(args, *, timeout, text=False, env=None,
+                  max_output_bytes=MAX_CAPTURED_OUTPUT_BYTES):
+    """Run a child while stopping producers that exceed either output cap."""
+    process = subprocess.Popen(
+        args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=env,
+    )
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    selector = selectors.DefaultSelector()
+    for stream in streams:
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                raise subprocess.TimeoutExpired(args, timeout)
+            for key, _ in selector.select(remaining):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                output = streams[key.fileobj]
+                if len(output) + len(chunk) > max_output_bytes:
+                    process.kill()
+                    raise CapturedOutputLimitError(
+                        f"child output exceeded {max_output_bytes} bytes"
+                    )
+                output.extend(chunk)
+        returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        raise
+    finally:
+        selector.close()
+        for stream in streams:
+            stream.close()
+
+    stdout = bytes(streams[process.stdout])
+    stderr = bytes(streams[process.stderr])
+    if text:
+        stdout = stdout.decode("utf-8", errors="replace")
+        stderr = stderr.decode("utf-8", errors="replace")
+    return subprocess.CompletedProcess(args, returncode, stdout, stderr)
 
 
 def _owned_path(path, allow_symlink=False):
@@ -400,9 +464,8 @@ def reset_settings():
 def list_audio_sources():
     sources = [{"id": "default", "name": "System default"}]
     try:
-        result = subprocess.run(
+        result = _run_captured(
             ["pactl", "-f", "json", "list", "sources"],
-            capture_output=True,
             text=True,
             timeout=3,
         )
@@ -469,9 +532,8 @@ def _hotkey_modmask(shortcut):
 
 def _hotkey_conflicts(hotkeys):
     try:
-        result = subprocess.run(
+        result = _run_captured(
             ["hyprctl", "-j", "binds"],
-            capture_output=True,
             text=True,
             timeout=3,
         )
@@ -571,7 +633,7 @@ def _restore_bindings(path, previous):
             _remove_owned_path(path)
         else:
             _write_private_text(path, previous)
-        subprocess.run(["hyprctl", "reload"], capture_output=True, text=True, timeout=5)
+        _run_captured(["hyprctl", "reload"], text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         pass
 
@@ -604,13 +666,13 @@ def apply_hotkeys(overrides=None, settings_template=None):
         candidate_settings["hotkeys"] = hotkeys
         _write_settings(candidate_settings)
         _write_private_text(bindings_path, new_content)
-        reload_result = subprocess.run(
-            ["hyprctl", "reload"], capture_output=True, text=True, timeout=5
+        reload_result = _run_captured(
+            ["hyprctl", "reload"], text=True, timeout=5
         )
         if reload_result.returncode != 0:
             raise RuntimeError("hyprctl reload failed")
-        errors_result = subprocess.run(
-            ["hyprctl", "configerrors"], capture_output=True, text=True, timeout=5
+        errors_result = _run_captured(
+            ["hyprctl", "configerrors"], text=True, timeout=5
         )
         if errors_result.returncode != 0 or (errors_result.stdout + errors_result.stderr).strip():
             raise RuntimeError("Hyprland reported configuration errors")
@@ -639,13 +701,13 @@ def remove_hotkeys():
             _remove_owned_path(bindings_path)
         else:
             _write_private_text(bindings_path, cleaned + "\n")
-        reload_result = subprocess.run(
-            ["hyprctl", "reload"], capture_output=True, text=True, timeout=5
+        reload_result = _run_captured(
+            ["hyprctl", "reload"], text=True, timeout=5
         )
         if reload_result.returncode != 0:
             raise RuntimeError("hyprctl reload failed")
-        errors_result = subprocess.run(
-            ["hyprctl", "configerrors"], capture_output=True, text=True, timeout=5
+        errors_result = _run_captured(
+            ["hyprctl", "configerrors"], text=True, timeout=5
         )
         if errors_result.returncode != 0 or (errors_result.stdout + errors_result.stderr).strip():
             raise RuntimeError("Hyprland reported configuration errors")
@@ -676,13 +738,12 @@ def run_audio_test():
         _ensure_private_dir(RUNTIME_DIR)
         fd, target = tempfile.mkstemp(prefix=".audio-test-", suffix=".wav", dir=RUNTIME_DIR)
         os.close(fd)
-        result = subprocess.run(
+        result = _run_captured(
             [
                 "ffmpeg", "-y", "-loglevel", "error", "-f", "pulse",
                 "-i", get_settings()["audio_source"], "-t", "0.5", "-ar", "16000",
                 "-ac", "1", target,
             ],
-            capture_output=True,
             text=True,
             timeout=5,
         )
@@ -720,9 +781,8 @@ def diagnostics():
         model_detail = f"Run voxtype setup model and install {LOCAL_VOXTYPE_MODEL}"
         if shutil.which("voxtype"):
             try:
-                result = subprocess.run(
+                result = _run_captured(
                     ["voxtype", "setup", "model", "--list"],
-                    capture_output=True,
                     text=True,
                     timeout=5,
                 )
@@ -877,7 +937,7 @@ def get_gemini_api_key():
     ]
     for args in lookups:
         try:
-            res = subprocess.run(args, capture_output=True, text=True, timeout=2)
+            res = _run_captured(args, text=True, timeout=2)
             if res.returncode == 0:
                 key = _secret_from_value(res.stdout)
                 if key:
@@ -918,7 +978,7 @@ def pill_ipc(action, *args):
                 cmd.extend(["-p", cfg])
             cmd.extend(["call", target, action, *str_args])
             try:
-                res = subprocess.run(cmd, capture_output=True, text=True, env=clean_env, timeout=1.0)
+                res = _run_captured(cmd, text=True, env=clean_env, timeout=1.0)
                 if res.returncode == 0 and res.stdout.strip() == "ok":
                     return True
             except Exception:
@@ -1065,6 +1125,7 @@ def _clear_audio_files():
 def _operation_lock():
     fd = None
     try:
+        _ensure_private_dir(RUNTIME_DIR)
         parent = os.path.dirname(LOCK_FILE) or "."
         if not os.path.isdir(parent) or os.path.islink(parent):
             raise OSError(f"private lock directory unavailable: {parent}")
@@ -1098,7 +1159,7 @@ def _operation_lock():
 
 def is_recording():
     valid = _valid_recording_pids()
-    if not valid:
+    if not valid and not _completed_recording_available():
         # A dead recorder must not leave a stale paused state behind.
         _remove_owned_path(STATE_FILE)
         _remove_owned_path(LEGACY_STATE_FILE)
@@ -1173,10 +1234,23 @@ def _start_recording():
     _clear_audio_files()
 
     try:
+        free_bytes = shutil.disk_usage(RUNTIME_DIR).free
+    except OSError as error:
+        log(f"Could not check recording storage: {type(error).__name__}")
+        pill_ipc("setStatus", "Storage Error")
+        return False
+    if free_bytes < MAX_AUDIO_BYTES + MIN_FREE_SPACE_BYTES:
+        log("Insufficient free space for bounded recording")
+        pill_ipc("setStatus", "Storage Full")
+        return False
+
+    try:
         proc = subprocess.Popen(
             [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-f", "pulse", "-i", get_settings()["audio_source"],
+                "-t", str(MAX_RECORDING_SECONDS),
+                "-fs", str(MAX_AUDIO_BYTES),
                 "-ar", "16000", "-ac", "1",
                 TEMP_AUDIO,
             ],
@@ -1347,6 +1421,26 @@ def _audio_target():
     return None
 
 
+def _completed_recording_available():
+    """Return true when a capped recorder exited after producing usable audio."""
+    state = _load_runtime_state()
+    if state.get("status") not in {"recording", "paused"}:
+        return False
+    pid = state.get("pid")
+    try:
+        if pid and _process_alive(int(pid)):
+            return False
+    except (TypeError, ValueError):
+        return False
+    target = _audio_target()
+    if target is None:
+        return False
+    try:
+        return 1000 <= os.path.getsize(target) <= MAX_AUDIO_BYTES
+    except OSError:
+        return False
+
+
 def _extract_voxtype_text(output):
     clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output or "")
     parts = re.split(r"Transcription completed in [^\n]+", clean, maxsplit=1)
@@ -1371,9 +1465,8 @@ class MissingApiKeyError(RuntimeError):
 
 
 def _transcribe_local(target_audio):
-    result = subprocess.run(
+    result = _run_captured(
         ["voxtype", "--model", LOCAL_VOXTYPE_MODEL, "transcribe", target_audio],
-        capture_output=True,
         text=True,
         timeout=120,
     )
@@ -1390,30 +1483,39 @@ def _transcribe_cloud(target_audio, model_choice):
     if not api_key:
         raise MissingApiKeyError
 
-    client = genai.Client(api_key=api_key)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(target_audio, flags)
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError("audio file is not a private regular file")
+        if info.st_size > MAX_AUDIO_BYTES:
+            raise ValueError("audio file exceeds application byte limit")
+        audio_bytes = handle.read(MAX_AUDIO_BYTES + 1)
+        if len(audio_bytes) > MAX_AUDIO_BYTES:
+            raise ValueError("audio file exceeds application byte limit")
+
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=NETWORK_TIMEOUT_MS,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+
     if model_choice == "gemini-3.5-transcribe":
-        # The dedicated transcribe model uses the Interactions API. The legacy
-        # Generate Content endpoint can return a stopped candidate with no
-        # parts for this model, which is indistinguishable from silence here.
         audio_file = client.files.upload(
-            file=target_audio,
+            file=io.BytesIO(audio_bytes),
             config=types.UploadFileConfig(mime_type="audio/wav"),
         )
         try:
             interaction = client.interactions.create(
                 model=model_choice,
-                input=[
-                    {
-                        "type": "audio",
-                        "uri": audio_file.uri,
-                        "mime_type": "audio/wav",
-                    }
-                ],
-                generation_config={
-                    "transcription_config": {
-                        "mode": "smart",
-                    }
-                },
+                input=[{
+                    "type": "audio", "uri": audio_file.uri,
+                    "mime_type": "audio/wav",
+                }],
+                generation_config={"transcription_config": {"mode": "smart"}},
             )
             return (getattr(interaction, "output_text", "") or "").strip()
         finally:
@@ -1423,16 +1525,13 @@ def _transcribe_cloud(target_audio, model_choice):
                     client.files.delete(name=uploaded_name)
                 except Exception as error:
                     log(f"Could not delete uploaded audio: {type(error).__name__}")
-    else:
-        with open(target_audio, "rb") as handle:
-            audio_bytes = handle.read()
-        response = client.models.generate_content(
-            model=model_choice,
-            contents=[
-                types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
-                "Transcribe this speech accurately. Clean up disfluencies, remove filler words like ums/ahs, format punctuation and capitalization properly. Return ONLY the transcribed text without quotes or explanations.",
-            ],
-        )
+    response = client.models.generate_content(
+        model=model_choice,
+        contents=[
+            types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+            "Transcribe this speech accurately. Clean up disfluencies, remove filler words like ums/ahs, format punctuation and capitalization properly. Return ONLY the transcribed text without quotes or explanations.",
+        ],
+    )
     return (response.text or "").strip()
 
 
@@ -1460,7 +1559,9 @@ def _inject_text(text, auto_submit=False):
             log("Clipboard copy failed; continuing with keyboard injection")
 
     try:
-        typed = subprocess.run(["wtype", "--", text], check=False, timeout=5)
+        typed = subprocess.run(
+            ["wtype", "-"], input=text, text=True, check=False, timeout=5
+        )
         if typed.returncode != 0:
             return False
     except (OSError, subprocess.SubprocessError):
@@ -1480,7 +1581,8 @@ def _inject_text(text, auto_submit=False):
 
 def _stop_recording(auto_submit=False, pids=None):
     pids = _active_recording_pids() if pids is None else pids
-    if not pids:
+    completed_recording = not pids and _completed_recording_available()
+    if not pids and not completed_recording:
         log("stop called, but not recording")
         _clear_runtime_markers()
         _clear_audio_files()
@@ -1496,9 +1598,14 @@ def _stop_recording(auto_submit=False, pids=None):
     pill_ipc("setTranscribing", "Transcribing...")
     target_audio = _audio_target()
     try:
-        if target_audio is None or os.path.getsize(target_audio) < 1000:
+        audio_size = os.path.getsize(target_audio) if target_audio else 0
+        if target_audio is None or audio_size < 1000:
             pill_ipc("setStatus", "Audio too short")
             log("Audio clip was too short or empty")
+            return False
+        if audio_size > MAX_AUDIO_BYTES:
+            pill_ipc("setStatus", "Audio too long")
+            log("Audio clip exceeded the application byte limit")
             return False
 
         try:
@@ -1542,7 +1649,7 @@ def toggle_recording(auto_submit=None):
         if not locked:
             return False
         pids = _active_recording_pids()
-        if pids:
+        if pids or _completed_recording_available():
             if auto_submit is None:
                 auto_submit = get_settings()["toggle_action"] == "submit"
             return _stop_recording(auto_submit=auto_submit, pids=pids)
