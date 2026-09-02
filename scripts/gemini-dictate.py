@@ -24,6 +24,7 @@ import shutil
 import importlib.util
 import selectors
 import io
+import concurrent.futures
 
 # Dynamically discover and include virtual environment site-packages (e.g. ~/.venv)
 def _ensure_venv_packages():
@@ -69,6 +70,13 @@ def _runtime_home():
     # A shared /tmp directory would allow another local user to read or
     # replace recordings. Keep the fallback user-scoped and private.
     return os.path.join(tempfile.gettempdir(), f"omarchy-flow-{os.getuid()}")
+
+
+def _is_within_runtime(path):
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(RUNTIME_DIR)]) == os.path.abspath(RUNTIME_DIR)
+    except (ValueError, OSError):
+        return False
 
 
 def _ensure_private_dir(path):
@@ -383,10 +391,9 @@ def _read_owned_text(path, max_bytes=MAX_READ_BYTES):
             return None
         if info.st_uid != os.getuid() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             return None
-        # Reject FIFO/device and overly permissive modes
+        # Reject overly permissive modes: group/other writable private files are suspicious
         if info.st_mode & 0o022:
-            # group/other writable regular file is suspicious for private data
-            pass
+            return None
         if info.st_size > max_bytes:
             return None
         # Use fdopen to read with ceiling
@@ -479,7 +486,13 @@ def _write_private_text(path, content):
         try:
             os.rename(tmp_name, base, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except OSError:
-            # Fallback to os.replace with absolute paths if renameat not available
+            # Fallback: re-validate parent then absolute replace (renameat may be unavailable)
+            try:
+                di2 = os.fstat(dir_fd)
+                if not stat.S_ISDIR(di2.st_mode) or di2.st_uid != os.getuid():
+                    raise OSError("parent mutated")
+            except OSError:
+                raise
             os.replace(os.path.join(parent, tmp_name), path)
         tmp_name = None
         # Ensure final file is 0600 and regular
@@ -1170,10 +1183,13 @@ def log(msg):
             os.fchmod(fd, 0o600)
         except OSError:
             pass
-        # Re-check size after open but before write to enforce ceiling
+        # Enforce hard ceiling: truncate if still oversized after rotation
         if info.st_size > MAX_LOG_BYTES * (MAX_LOG_BACKUPS + 1):
-            # Already too large, truncate via rotation attempt already done
-            pass
+            try:
+                os.ftruncate(fd, 0)
+            except OSError:
+                pass
+            # Force rotation again on next call
         with os.fdopen(fd, "a", encoding="utf-8") as handle:
             fd = None
             handle.write(f"[{datetime.datetime.now().isoformat()}] {msg}\n")
@@ -1293,7 +1309,8 @@ def get_gemini_api_key():
 def pill_ipc(action, *args):
     """Send one HUD IPC call, preferring the canonical namespaced target."""
     clean_env = os.environ.copy()
-    clean_env.pop("LD_LIBRARY_PATH", None)
+    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "LD_DEBUG", "PYTHONPATH", "PYTHONHOME"):
+        clean_env.pop(key, None)
 
     targets = ["io.github.ef-code.omarchy-flow.pill", "geminipill"]
     config_paths = [
@@ -1499,11 +1516,11 @@ def _clear_audio_files():
     try:
         state = _load_runtime_state()
         ap = state.get("audio_path")
-        if ap and os.path.abspath(ap).startswith(os.path.abspath(RUNTIME_DIR)):
+        if ap and _is_within_runtime(ap):
             _remove_owned_path(ap)
             # Try to remove its parent cap dir if empty
             parent = os.path.dirname(ap)
-            if parent != RUNTIME_DIR and os.path.abspath(parent).startswith(os.path.abspath(RUNTIME_DIR)):
+            if parent != RUNTIME_DIR and _is_within_runtime(parent):
                 try:
                     st = os.lstat(parent)
                     if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
@@ -1673,7 +1690,7 @@ def update_runtime_state(status, paused=False, pid=None, start_ticks=None, audio
     if audio_path is None:
         try:
             existing = _load_runtime_state().get("audio_path")
-            if existing and os.path.abspath(existing).startswith(os.path.abspath(RUNTIME_DIR)):
+            if existing and _is_within_runtime(existing):
                 audio_path = existing
         except Exception:
             pass
@@ -1961,7 +1978,7 @@ def _audio_target():
     try:
         state = _load_runtime_state()
         ap = state.get("audio_path")
-        if ap:
+        if ap and _is_within_runtime(ap):
             # Validate via owned descriptor
             info = _owned_path(ap)
             if info is not None:
@@ -1975,7 +1992,7 @@ def _audio_target():
                         fd = os.open(base, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
                         try:
                             fi = os.fstat(fd)
-                            if fi.st_uid == os.getuid() and stat.S_ISREG(fi.st_mode) and fi.st_nlink == 1 and fi.st_size > 0 and fi.st_size <= MAX_AUDIO_BYTES:
+                            if fi.st_uid == os.getuid() and stat.S_ISREG(fi.st_mode) and fi.st_nlink == 1 and fi.st_size > 0:
                                 return ap
                         finally:
                             try:
@@ -2150,13 +2167,17 @@ def _transcribe_cloud(target_audio, model_choice):
         ),
     )
 
-    # Hard end-to-end deadline wrapper: ensure total operation bounded
+    # Hard end-to-end deadline wrapper: enforce outer deadline even if SDK call blocks
     def _bounded_call(fn, *args, **kwargs):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("transcription deadline exceeded")
-        # The SDK respects http_options timeout, but we also enforce outer deadline
-        return fn(*args, **kwargs)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fn, *args, **kwargs)
+            try:
+                return future.result(timeout=remaining)
+            except concurrent.futures.TimeoutError as exc:
+                raise TimeoutError("transcription deadline exceeded") from exc
 
     if model_choice == "gemini-3.5-transcribe":
         audio_file = _bounded_call(client.files.upload,

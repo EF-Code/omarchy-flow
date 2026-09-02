@@ -78,6 +78,7 @@ Item {
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
       font.bold: true
+      textFormat: Text.PlainText
     }
 
     BorderSurface {

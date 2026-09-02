@@ -137,6 +137,7 @@ Item {
             root.statusText = "Listening..."
             root.stateMode = "listening"
             root.isVisible = true
+            root.dropdownOpen = false
             return "ok"
         }
 

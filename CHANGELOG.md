@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Harden captured helper execution to run in a new session with process-group `TERM -> bounded grace -> KILL` and close inherited pipe descriptors, preventing descendant leaks on timeout or output overflow.
+- Make private-file handling descriptor-relative (`O_NOFOLLOW`/`O_NONBLOCK` from held private directory, `fstat` owner/type/nlink checks, strict read ceilings, exclusive `renameat`, bounded log rotation and truncation).
+- Replace predictable `recording.wav` + `ffmpeg -y` with exclusively created private capture directory (`mkdtemp .cap-*`) and descriptor-validated audio discovery, avoiding same-UID swap between clear and open.
+- Enforce hard end-to-end transcription deadline (90 s) with `ThreadPoolExecutor` bounded SDK calls and strict transcript char/byte ceilings before clipboard/typing; suppress `wl-copy`/`wtype` output to `DEVNULL`.
+- Add per-job QML watchdogs, `Component.onDestruction` cleanup, bounded JSON parsing/cardinality and `Text.PlainText` for externally derived strings (SettingsView conflicts/diagnostics, BarWidget/Pill/FlowDropdown).
+- Rate-limit log writes and rotate logs, scrub additional `LD_*`/`PYTHON*` env vars in `pill_ipc`, and harden `flowctl` audio test capture.
+
 ## [0.4.0] - 2026-08-30
 
 ### Added
