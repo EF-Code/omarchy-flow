@@ -16,6 +16,22 @@ Item {
     property bool waveformEnabled: true
 
     readonly property string flowctlPath: decodeURIComponent(String(Qt.resolvedUrl("scripts/flowctl")).replace(/^file:\/\//, ""))
+    readonly property int maxTextLength: 256
+
+    function sanitizedStatusText(raw) {
+        if (!raw || typeof raw !== "string") return ""
+        var s = raw.trim()
+        if (s.length > 128) s = s.slice(0, 128)
+        return s
+    }
+
+    function sanitizedModelId(raw) {
+        if (!raw || typeof raw !== "string") return "whisper-base.en"
+        var s = raw.trim()
+        if (s.length > 64) s = s.slice(0, 64)
+        if (s === "whisper-base.en" || s === "gemini-3.5-transcribe" || s === "gemini-3.7-flash") return s
+        return "whisper-base.en"
+    }
 
     function runProcess(process): string {
         if (!process || process.running) return "busy"
@@ -31,11 +47,19 @@ Item {
         stdout: SplitParser {
             onRead: function(data) {
                 var m = data.trim()
+                if (m.length > 64) m = m.slice(0, 64)
                 if (m) {
-                    root.selectedModel = m
+                    root.selectedModel = root.sanitizedModelId(m)
                 }
             }
         }
+        Component.onDestruction: if (running) running = false
+    }
+
+    Timer {
+        interval: 3000
+        running: loadModelProcess.running
+        onTriggered: loadModelProcess.running = false
     }
 
     // Save model process
@@ -44,10 +68,18 @@ Item {
         command: []
         function save(modelId: string): string {
             if (running) return "busy"
-            command = [root.flowctlPath, "model", modelId]
+            var safe = root.sanitizedModelId(modelId)
+            command = [root.flowctlPath, "model", safe]
             running = true
             return "ok"
         }
+        Component.onDestruction: if (running) running = false
+    }
+
+    Timer {
+        interval: 5000
+        running: saveModelProcess.running
+        onTriggered: saveModelProcess.running = false
     }
 
     Process {
@@ -61,12 +93,21 @@ Item {
         onExited: function(exitCode) {
             if (exitCode !== 0 || !settingsOutput.text) return
             try {
-                var settings = JSON.parse(settingsOutput.text.trim())
+                var raw = settingsOutput.text
+                if (raw.length > 8192) raw = raw.slice(0, 8192)
+                var settings = JSON.parse(raw.trim())
                 if (settings.hud_enabled !== undefined) root.hudEnabled = settings.hud_enabled === true
                 if (settings.hud_position === "top" || settings.hud_position === "bottom") root.hudPosition = settings.hud_position
                 if (settings.waveform_enabled !== undefined) root.waveformEnabled = settings.waveform_enabled === true
             } catch (e) {}
         }
+        Component.onDestruction: if (running) running = false
+    }
+
+    Timer {
+        interval: 5000
+        running: loadSettingsProcess.running
+        onTriggered: loadSettingsProcess.running = false
     }
 
     IpcHandler {
@@ -122,7 +163,8 @@ Item {
         }
 
         function setStatus(text: string): string {
-            root.statusText = text || "Status"
+            var safe = root.sanitizedStatusText(text) || "Status"
+            root.statusText = safe
             root.stateMode = "status"
             root.isVisible = true
             root.dropdownOpen = false
@@ -178,19 +220,27 @@ Item {
     Process {
         id: pauseProcess
         command: [root.flowctlPath, "pause"]
+        Component.onDestruction: if (running) running = false
     }
+    Timer { interval: 8000; running: pauseProcess.running; onTriggered: pauseProcess.running = false }
     Process {
         id: transcribeProcess
         command: [root.flowctlPath, "stop"]
+        Component.onDestruction: if (running) running = false
     }
+    Timer { interval: 15000; running: transcribeProcess.running; onTriggered: transcribeProcess.running = false }
     Process {
         id: cancelProcess
         command: [root.flowctlPath, "cancel"]
+        Component.onDestruction: if (running) running = false
     }
+    Timer { interval: 8000; running: cancelProcess.running; onTriggered: cancelProcess.running = false }
     Process {
         id: toggleProcess
         command: [root.flowctlPath, "toggle"]
+        Component.onDestruction: if (running) running = false
     }
+    Timer { interval: 10000; running: toggleProcess.running; onTriggered: toggleProcess.running = false }
 
     PanelWindow {
         id: panel
@@ -275,11 +325,13 @@ Item {
                                         font.pixelSize: 11
                                         font.weight: root.selectedModel === modelData.id ? Font.DemiBold : Font.Normal
                                         color: root.selectedModel === modelData.id ? "#FFFFFF" : "#F1F5F9"
+                                        textFormat: Text.PlainText
                                     }
                                     Text {
                                         text: modelData.subtitle
                                         font.pixelSize: 9
                                         color: "#CBD5E1"
+                                        textFormat: Text.PlainText
                                     }
                                 }
                             }
@@ -294,6 +346,7 @@ Item {
                                 font.pixelSize: 12
                                 font.bold: true
                                 color: "#FFFFFF"
+                                textFormat: Text.PlainText
                             }
 
                             MouseArea {
@@ -476,12 +529,15 @@ Item {
                                     if (root.stateMode === "done") return "#4ADE80"
                                     return "#FFFFFF"
                                 }
+                                textFormat: Text.PlainText
+                                elide: Text.ElideRight
                             }
                             Text {
                                 visible: root.stateMode === "listening" || root.stateMode === "paused"
                                 text: root.dropdownOpen ? "▴" : "▾"
                                 font.pixelSize: 9
                                 color: "#CBD5E1"
+                                textFormat: Text.PlainText
                             }
                         }
 
@@ -555,6 +611,7 @@ Item {
                                     text: "▶"
                                     font.pixelSize: 10
                                     color: "#FBBF24"
+                                    textFormat: Text.PlainText
                                 }
                             }
 
@@ -587,6 +644,7 @@ Item {
                                 font.pixelSize: 13
                                 font.bold: true
                                 color: transcribeMouse.containsMouse ? "#FFFFFF" : "#F1F5F9"
+                                textFormat: Text.PlainText
                             }
 
                             MouseArea {
@@ -617,6 +675,7 @@ Item {
                                 text: "✕"
                                 font.pixelSize: 11
                                 color: cancelMouse.containsMouse ? "#EF4444" : "#E2E8F0"
+                                textFormat: Text.PlainText
                             }
 
                             MouseArea {

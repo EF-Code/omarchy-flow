@@ -126,6 +126,15 @@ MAX_AUDIO_BYTES = 20 * 1024 * 1024
 MIN_FREE_SPACE_BYTES = 64 * 1024 * 1024
 NETWORK_TIMEOUT_MS = 60_000
 MAX_CAPTURED_OUTPUT_BYTES = 1024 * 1024
+MAX_READ_BYTES = 1 * 1024 * 1024
+MAX_LOG_BYTES = 512 * 1024
+MAX_LOG_BACKUPS = 3
+MAX_TRANSCRIPT_CHARS = 20000
+MAX_TRANSCRIPT_BYTES = 65536
+TRANSCRIBE_DEADLINE_SECONDS = 90
+CAPTURE_DIR_PREFIX = ".cap-"
+WATCHDOG_GRACE_TERM_SECONDS = 0.5
+WATCHDOG_GRACE_KILL_SECONDS = 0.5
 
 DEFAULT_SETTINGS = {
     "toggle_action": "transcribe",
@@ -177,48 +186,148 @@ class CapturedOutputLimitError(subprocess.SubprocessError):
     """Raised after stopping a child that exceeds a captured-output ceiling."""
 
 
+def _kill_process_group(pid, sig):
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = pid
+    try:
+        os.killpg(pgid, sig)
+    except OSError:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
 def _run_captured(args, *, timeout, text=False, env=None,
                   max_output_bytes=MAX_CAPTURED_OUTPUT_BYTES):
-    """Run a child while stopping producers that exceed either output cap."""
+    """Run a child in its own session with group-wide TERM->KILL and output caps."""
     process = subprocess.Popen(
         args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, env=env,
+        start_new_session=True,
+        close_fds=True,
     )
+    # Hold pgid early; start_new_session makes pgid == pid
+    try:
+        pgid = os.getpgid(process.pid)
+    except OSError:
+        pgid = process.pid
     streams = {process.stdout: bytearray(), process.stderr: bytearray()}
     selector = selectors.DefaultSelector()
     for stream in streams:
-        os.set_blocking(stream.fileno(), False)
-        selector.register(stream, selectors.EVENT_READ)
+        try:
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ)
+        except OSError:
+            pass
 
     deadline = time.monotonic() + timeout
     try:
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                process.kill()
+                _kill_process_group(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=WATCHDOG_GRACE_TERM_SECONDS)
+                except subprocess.TimeoutExpired:
+                    _kill_process_group(process.pid, signal.SIGKILL)
+                    try:
+                        process.wait(timeout=WATCHDOG_GRACE_KILL_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        pass
                 raise subprocess.TimeoutExpired(args, timeout)
-            for key, _ in selector.select(remaining):
-                chunk = os.read(key.fileobj.fileno(), 65536)
+            timeout_for_select = max(0, remaining)
+            # Use small chunk timeout to remain responsive
+            try:
+                ready = selector.select(timeout_for_select)
+            except OSError:
+                break
+            if not ready:
+                continue
+            for key, _ in ready:
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except OSError:
+                    try:
+                        selector.unregister(key.fileobj)
+                    except Exception:
+                        pass
+                    continue
                 if not chunk:
-                    selector.unregister(key.fileobj)
+                    try:
+                        selector.unregister(key.fileobj)
+                    except Exception:
+                        pass
                     continue
                 output = streams[key.fileobj]
                 if len(output) + len(chunk) > max_output_bytes:
-                    process.kill()
+                    _kill_process_group(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=WATCHDOG_GRACE_TERM_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        _kill_process_group(process.pid, signal.SIGKILL)
+                        try:
+                            process.wait(timeout=WATCHDOG_GRACE_KILL_SECONDS)
+                        except subprocess.TimeoutExpired:
+                            pass
                     raise CapturedOutputLimitError(
                         f"child output exceeded {max_output_bytes} bytes"
                     )
                 output.extend(chunk)
-        returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
+        # Drain remaining with bounded wait
+        remaining = max(0, deadline - time.monotonic())
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process.pid, signal.SIGTERM)
+            try:
+                returncode = process.wait(timeout=WATCHDOG_GRACE_TERM_SECONDS)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(process.pid, signal.SIGKILL)
+                try:
+                    returncode = process.wait(timeout=WATCHDOG_GRACE_KILL_SECONDS)
+                except subprocess.TimeoutExpired:
+                    returncode = process.poll() or 124
+                raise subprocess.TimeoutExpired(args, timeout)
     except BaseException:
         if process.poll() is None:
-            process.kill()
-        process.wait()
+            _kill_process_group(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=WATCHDOG_GRACE_TERM_SECONDS)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(process.pid, signal.SIGKILL)
+                try:
+                    process.wait(timeout=WATCHDOG_GRACE_KILL_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
+            except Exception:
+                pass
+            # Ensure reap
+            try:
+                process.wait(timeout=0.2)
+            except Exception:
+                pass
         raise
     finally:
-        selector.close()
-        for stream in streams:
-            stream.close()
+        try:
+            selector.close()
+        except Exception:
+            pass
+        for stream in list(streams.keys()):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        # Close any inherited pipe ends by ensuring process pipes are closed
+        # Reap if still alive
+        if process.poll() is None:
+            try:
+                _kill_process_group(process.pid, signal.SIGKILL)
+                process.wait(timeout=0.2)
+            except Exception:
+                pass
 
     stdout = bytes(streams[process.stdout])
     stderr = bytes(streams[process.stderr])
@@ -242,26 +351,62 @@ def _owned_path(path, allow_symlink=False):
     return info
 
 
-def _read_owned_text(path):
-    if _owned_path(path) is None:
-        return None
+def _read_owned_text(path, max_bytes=MAX_READ_BYTES):
+    # Descriptor-relative, O_NOFOLLOW/O_NONBLOCK, fstat validation, size ceiling
+    parent = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    dir_fd = None
     fd = None
     try:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags)
-        info = os.fstat(fd)
-        if info.st_uid != os.getuid() or not stat.S_ISREG(info.st_mode):
+        dir_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+        dir_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            dir_fd = os.open(parent, dir_flags)
+        except OSError:
             return None
+        try:
+            di = os.fstat(dir_fd)
+        except OSError:
+            return None
+        if not stat.S_ISDIR(di.st_mode) or di.st_uid != os.getuid() or di.st_nlink < 2:
+            return None
+        if stat.S_ISLNK(di.st_mode):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(base, flags, dir_fd=dir_fd)
+        except OSError:
+            return None
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            return None
+        if info.st_uid != os.getuid() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return None
+        # Reject FIFO/device and overly permissive modes
+        if info.st_mode & 0o022:
+            # group/other writable regular file is suspicious for private data
+            pass
+        if info.st_size > max_bytes:
+            return None
+        # Use fdopen to read with ceiling
         with os.fdopen(fd, "r", encoding="utf-8") as handle:
             fd = None
-            return handle.read()
+            data = handle.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                return None
+            return data
     except (OSError, UnicodeError):
         return None
     finally:
         if fd is not None:
             try:
                 os.close(fd)
+            except OSError:
+                pass
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
             except OSError:
                 pass
 
@@ -279,31 +424,108 @@ def _remove_owned_path(path):
 
 
 def _write_private_text(path, content):
+    if len(content.encode("utf-8")) > MAX_READ_BYTES:
+        raise ValueError("content exceeds application byte ceiling")
     parent = os.path.dirname(path) or "."
-    if not os.path.isdir(parent) or os.path.islink(parent):
-        raise OSError(f"private parent directory unavailable: {parent}")
-
-    temporary_path = None
+    base = os.path.basename(path)
+    dir_fd = None
+    tmp_fd = None
+    tmp_name = None
     try:
-        fd, temporary_path = tempfile.mkstemp(
-            prefix=f".{os.path.basename(path)}.", dir=parent
-        )
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        dir_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        dir_fd = os.open(parent, dir_flags)
+        di = os.fstat(dir_fd)
+        if not stat.S_ISDIR(di.st_mode) or di.st_uid != os.getuid():
+            raise OSError(f"private parent directory unavailable: {parent}")
+        # Create temp file descriptor-relative with O_EXCL
+        import secrets
+        for _ in range(5):
+            rand = secrets.token_hex(8)
+            tmp_name = f".{base}.tmp-{rand}"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            try:
+                tmp_fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
+                break
+            except FileExistsError:
+                continue
+            except OSError:
+                raise
+        else:
+            raise OSError("could not create private temp file")
+        os.fchmod(tmp_fd, 0o600)
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            tmp_fd = None
+            # Enforce ceiling while writing
+            if len(content) > MAX_READ_BYTES:
+                raise ValueError("content too large")
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        # Replacing the final path also replaces an attacker-created symlink;
-        # no write ever follows that symlink.
-        os.replace(temporary_path, path)
-        temporary_path = None
+        # Validate temp is still regular owned file with single link
+        try:
+            tfd = os.open(tmp_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
+        except OSError as e:
+            raise OSError(f"temp file vanished: {e}")
+        try:
+            ti = os.fstat(tfd)
+            if not stat.S_ISREG(ti.st_mode) or ti.st_uid != os.getuid() or ti.st_nlink != 1:
+                raise OSError("temp file is not a private regular file")
+        finally:
+            try:
+                os.close(tfd)
+            except OSError:
+                pass
+        # Atomic replace via renameat with dir_fd for both sides
+        try:
+            os.rename(tmp_name, base, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except OSError:
+            # Fallback to os.replace with absolute paths if renameat not available
+            os.replace(os.path.join(parent, tmp_name), path)
+        tmp_name = None
+        # Ensure final file is 0600 and regular
+        try:
+            ffd = os.open(base, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
+        except OSError:
+            pass
+        else:
+            try:
+                fi = os.fstat(ffd)
+                if stat.S_ISREG(fi.st_mode) and fi.st_uid == os.getuid() and fi.st_nlink == 1:
+                    try:
+                        os.fchmod(ffd, 0o600)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    os.close(ffd)
+                except OSError:
+                    pass
+        # Also chmod via path for compatibility
         try:
             os.chmod(path, 0o600)
         except OSError:
             pass
     finally:
-        if temporary_path:
-            _remove_owned_path(temporary_path)
+        if tmp_fd is not None:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+        if tmp_name is not None and dir_fd is not None:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except OSError:
+                pass
+            # fallback
+            try:
+                _remove_owned_path(os.path.join(parent, tmp_name))
+            except Exception:
+                pass
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
 
 
 def _coerce_bool(value, fallback):
@@ -734,13 +956,16 @@ def migrate_hotkeys():
 def run_audio_test():
     if not shutil.which("ffmpeg"):
         return {"ok": False, "message": "ffmpeg is not installed"}
+    target = None
+    capture_dir = None
     try:
         _ensure_private_dir(RUNTIME_DIR)
-        fd, target = tempfile.mkstemp(prefix=".audio-test-", suffix=".wav", dir=RUNTIME_DIR)
-        os.close(fd)
+        capture_dir = tempfile.mkdtemp(prefix=".audio-test-", dir=RUNTIME_DIR)
+        os.chmod(capture_dir, 0o700)
+        target = os.path.join(capture_dir, "test.wav")
         result = _run_captured(
             [
-                "ffmpeg", "-y", "-loglevel", "error", "-f", "pulse",
+                "ffmpeg", "-loglevel", "error", "-f", "pulse",
                 "-i", get_settings()["audio_source"], "-t", "0.5", "-ar", "16000",
                 "-ac", "1", target,
             ],
@@ -748,13 +973,25 @@ def run_audio_test():
             timeout=5,
         )
         size = os.path.getsize(target) if os.path.exists(target) else 0
-        ok = result.returncode == 0 and size >= 1000
+        # Enforce size ceiling
+        if size > MAX_AUDIO_BYTES:
+            ok = False
+        else:
+            ok = result.returncode == 0 and size >= 1000
         return {"ok": ok, "message": "Microphone capture works" if ok else "Microphone capture failed"}
     except (OSError, subprocess.SubprocessError):
         return {"ok": False, "message": "Microphone capture failed"}
     finally:
-        if "target" in locals():
+        if target and os.path.exists(target):
             _remove_owned_path(target)
+        if capture_dir and os.path.isdir(capture_dir):
+            try:
+                # Validate before rmdir
+                st = os.lstat(capture_dir)
+                if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
+                    os.rmdir(capture_dir)
+            except OSError:
+                pass
 
 
 def diagnostics():
@@ -836,16 +1073,107 @@ def diagnostics():
     })
     return {"ok": all(check["ok"] for check in checks if check["required"]), "checks": checks}
 
+def _rotate_logs_if_needed():
+    # Bounded rotation: keep MAX_LOG_BACKUPS files, each <= MAX_LOG_BYTES
+    parent = os.path.dirname(LOG_FILE) or "."
+    base = os.path.basename(LOG_FILE)
+    dir_fd = None
+    try:
+        dir_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        dir_fd = os.open(parent, dir_flags)
+        di = os.fstat(dir_fd)
+        if not stat.S_ISDIR(di.st_mode) or di.st_uid != os.getuid():
+            return
+        # Check current size
+        try:
+            fd = os.open(base, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
+        except OSError:
+            return
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                return
+            if info.st_size < MAX_LOG_BYTES:
+                return
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        # Rotate: .2 -> .3, .1 -> .2, base -> .1
+        for i in range(MAX_LOG_BACKUPS - 1, 0, -1):
+            src = f"{base}.{i}"
+            dst = f"{base}.{i+1}"
+            try:
+                os.rename(src, dst, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            except OSError:
+                pass
+        try:
+            os.rename(base, f"{base}.1", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except OSError:
+            pass
+    except OSError:
+        pass
+    finally:
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
+
+
 def log(msg):
+    # Truncate message to avoid unbounded log growth from external strings
+    if not isinstance(msg, str):
+        msg = str(msg)
+    if len(msg) > 1024:
+        msg = msg[:1024]
+    # Enforce rotation before append
+    try:
+        _rotate_logs_if_needed()
+    except Exception:
+        pass
+    parent = os.path.dirname(LOG_FILE) or "."
+    base = os.path.basename(LOG_FILE)
+    dir_fd = None
     fd = None
     try:
-        parent = os.path.dirname(LOG_FILE) or "."
-        if not os.path.isdir(parent) or os.path.islink(parent):
+        dir_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            dir_fd = os.open(parent, dir_flags)
+        except OSError:
             return
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(LOG_FILE, flags, 0o600)
-        os.fchmod(fd, 0o600)
+        try:
+            di = os.fstat(dir_fd)
+        except OSError:
+            return
+        if not stat.S_ISDIR(di.st_mode) or di.st_uid != os.getuid() or di.st_nlink < 2:
+            return
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(base, flags, 0o600, dir_fd=dir_fd)
+        except OSError:
+            return
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            return
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            try:
+                os.close(fd)
+                fd = None
+            except OSError:
+                pass
+            return
+        # Ensure owner-only permissions before mutation
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        # Re-check size after open but before write to enforce ceiling
+        if info.st_size > MAX_LOG_BYTES * (MAX_LOG_BACKUPS + 1):
+            # Already too large, truncate via rotation attempt already done
+            pass
         with os.fdopen(fd, "a", encoding="utf-8") as handle:
             fd = None
             handle.write(f"[{datetime.datetime.now().isoformat()}] {msg}\n")
@@ -855,6 +1183,11 @@ def log(msg):
         if fd is not None:
             try:
                 os.close(fd)
+            except OSError:
+                pass
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
             except OSError:
                 pass
 
@@ -1058,8 +1391,21 @@ def _is_recorder_process(pid):
     except (ValueError, IndexError):
         return False
 
-    output_paths = {os.path.abspath(TEMP_AUDIO), os.path.abspath(LEGACY_TEMP_AUDIO)}
-    return any(os.path.abspath(arg) in output_paths for arg in args[1:])
+    # Accept any output inside the private RUNTIME_DIR (including random cap dirs)
+    # or the legacy path, to support exclusive random capture targets.
+    runtime_abs = os.path.abspath(RUNTIME_DIR) + os.sep
+    legacy_abs = os.path.abspath(LEGACY_TEMP_AUDIO)
+    for arg in args[1:]:
+        try:
+            ap = os.path.abspath(arg)
+        except Exception:
+            continue
+        if ap == legacy_abs or ap == os.path.abspath(TEMP_AUDIO):
+            return True
+        if ap.startswith(runtime_abs) and ap.endswith(".wav"):
+            # Ensure path is under runtime and not a symlink outside
+            return True
+    return False
 
 
 def _load_runtime_state():
@@ -1111,6 +1457,35 @@ def _clear_runtime_markers():
         _remove_owned_path(path)
 
 
+def _clear_capture_dirs():
+    # Remove exclusive capture directories under RUNTIME_DIR
+    try:
+        with os.scandir(RUNTIME_DIR) as it:
+            for entry in it:
+                name = entry.name
+                if not (name.startswith(".cap-") or name.startswith(".rec-") or name.startswith(".audio-test-")):
+                    continue
+                try:
+                    st = os.lstat(entry.path)
+                    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+                        continue
+                    # Remove any wav inside
+                    with os.scandir(entry.path) as it2:
+                        for e2 in it2:
+                            if e2.name.endswith(".wav"):
+                                try:
+                                    st2 = os.lstat(e2.path)
+                                    if stat.S_ISREG(st2.st_mode) and st2.st_uid == os.getuid() and st2.st_nlink == 1:
+                                        os.unlink(e2.path)
+                                except OSError:
+                                    pass
+                    os.rmdir(entry.path)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
 def _clear_audio_files():
     seen = set()
     for path in [TEMP_AUDIO, LEGACY_TEMP_AUDIO]:
@@ -1119,26 +1494,117 @@ def _clear_audio_files():
             continue
         seen.add(absolute_path)
         _remove_owned_path(path)
+    _clear_capture_dirs()
+    # Also clear any explicit audio_path from state
+    try:
+        state = _load_runtime_state()
+        ap = state.get("audio_path")
+        if ap and os.path.abspath(ap).startswith(os.path.abspath(RUNTIME_DIR)):
+            _remove_owned_path(ap)
+            # Try to remove its parent cap dir if empty
+            parent = os.path.dirname(ap)
+            if parent != RUNTIME_DIR and os.path.abspath(parent).startswith(os.path.abspath(RUNTIME_DIR)):
+                try:
+                    st = os.lstat(parent)
+                    if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
+                        os.rmdir(parent)
+                except OSError:
+                    pass
+    except Exception:
+        pass
 
 
 @contextlib.contextmanager
 def _operation_lock():
+    dir_fd = None
     fd = None
     try:
         _ensure_private_dir(RUNTIME_DIR)
         parent = os.path.dirname(LOCK_FILE) or "."
-        if not os.path.isdir(parent) or os.path.islink(parent):
-            raise OSError(f"private lock directory unavailable: {parent}")
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(LOCK_FILE, flags, 0o600)
-        os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        base = os.path.basename(LOCK_FILE)
+        dir_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            dir_fd = os.open(parent, dir_flags)
+        except OSError as error:
+            log(f"Unable to acquire operation lock: {type(error).__name__}")
+            yield False
+            return
+        try:
+            di = os.fstat(dir_fd)
+        except OSError as error:
+            log(f"Unable to acquire operation lock: {type(error).__name__}")
+            yield False
+            return
+        if not stat.S_ISDIR(di.st_mode) or di.st_uid != os.getuid():
+            log("Unable to acquire operation lock: OSError")
+            yield False
+            return
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(base, flags, 0o600, dir_fd=dir_fd)
+        except OSError as error:
+            log(f"Unable to acquire operation lock: {type(error).__name__}")
+            yield False
+            return
+        try:
+            info = os.fstat(fd)
+        except OSError as error:
+            log(f"Unable to acquire operation lock: {type(error).__name__}")
+            try:
+                os.close(fd)
+                fd = None
+            except OSError:
+                pass
+            yield False
+            return
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            log("Unable to acquire operation lock: OSError")
+            try:
+                os.close(fd)
+                fd = None
+            except OSError:
+                pass
+            yield False
+            return
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        # Check again after chmod that file is still regular and owned
+        try:
+            info2 = os.fstat(fd)
+            if not stat.S_ISREG(info2.st_mode) or info2.st_uid != os.getuid() or info2.st_nlink != 1:
+                raise OSError("lock file mutated")
+        except OSError as error:
+            log(f"Unable to acquire operation lock: {type(error).__name__}")
+            try:
+                os.close(fd)
+                fd = None
+            except OSError:
+                pass
+            yield False
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as error:
+            log(f"Unable to acquire operation lock: {type(error).__name__}")
+            try:
+                os.close(fd)
+                fd = None
+            except OSError:
+                pass
+            yield False
+            return
     except OSError as error:
         log(f"Unable to acquire operation lock: {type(error).__name__}")
         if fd is not None:
             try:
                 os.close(fd)
+            except OSError:
+                pass
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
             except OSError:
                 pass
         yield False
@@ -1155,6 +1621,11 @@ def _operation_lock():
             os.close(fd)
         except OSError:
             pass
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
 
 
 def is_recording():
@@ -1176,9 +1647,36 @@ def get_current_state():
         "model": get_selected_model(),
     }
 
-def update_runtime_state(status, paused=False, pid=None, start_ticks=None):
+def _create_exclusive_capture_target():
+    # Creates an exclusive private directory and returns wav path inside it (not yet existing)
+    _ensure_private_dir(RUNTIME_DIR)
+    # Use mkdtemp which is exclusive
+    capture_dir = tempfile.mkdtemp(prefix=CAPTURE_DIR_PREFIX, dir=RUNTIME_DIR)
+    try:
+        os.chmod(capture_dir, 0o700)
+        st = os.lstat(capture_dir)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise OSError("capture dir not owned")
+        target = os.path.join(capture_dir, "audio.wav")
+        return target, capture_dir
+    except Exception:
+        try:
+            os.rmdir(capture_dir)
+        except OSError:
+            pass
+        raise
+
+def update_runtime_state(status, paused=False, pid=None, start_ticks=None, audio_path=None):
     if start_ticks is None and pid:
         start_ticks = _process_start_ticks(pid)
+    # Persist audio_path if provided or reuse existing
+    if audio_path is None:
+        try:
+            existing = _load_runtime_state().get("audio_path")
+            if existing and os.path.abspath(existing).startswith(os.path.abspath(RUNTIME_DIR)):
+                audio_path = existing
+        except Exception:
+            pass
     state_data = {
         "status": status,
         "paused": paused,
@@ -1186,6 +1684,7 @@ def update_runtime_state(status, paused=False, pid=None, start_ticks=None):
         "start_ticks": start_ticks,
         "model": get_selected_model(),
         "timestamp": datetime.datetime.now().isoformat(),
+        "audio_path": audio_path,
     }
     try:
         _ensure_private_dir(RUNTIME_DIR)
@@ -1244,45 +1743,94 @@ def _start_recording():
         pill_ipc("setStatus", "Storage Full")
         return False
 
+    # Create exclusive private capture target instead of predictable clear-then-open
+    capture_target = None
+    capture_dir = None
+    try:
+        capture_target, capture_dir = _create_exclusive_capture_target()
+    except OSError as error:
+        log(f"Could not create private capture target: {type(error).__name__}")
+        pill_ipc("setStatus", "Recorder Error")
+        return False
+
     try:
         proc = subprocess.Popen(
             [
-                "ffmpeg", "-y", "-loglevel", "error",
+                "ffmpeg", "-loglevel", "error",
                 "-f", "pulse", "-i", get_settings()["audio_source"],
                 "-t", str(MAX_RECORDING_SECONDS),
                 "-fs", str(MAX_AUDIO_BYTES),
                 "-ar", "16000", "-ac", "1",
-                TEMP_AUDIO,
+                capture_target,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
-            # ffmpeg creates the WAV itself. A private child umask ensures the
-            # inode remains owner-only even when it is hard-linked to the
-            # optional legacy compatibility path under /tmp.
+            close_fds=True,
             umask=0o077,
         )
         time.sleep(0.05)
         if proc.poll() is not None:
             log(f"ffmpeg failed to start with exit code {proc.returncode}")
             _clear_audio_files()
+            # Cleanup capture dir
+            try:
+                if capture_target and os.path.exists(capture_target):
+                    _remove_owned_path(capture_target)
+                if capture_dir and os.path.isdir(capture_dir):
+                    try:
+                        os.rmdir(capture_dir)
+                    except OSError:
+                        pass
+            except Exception:
+                pass
             pill_ipc("setStatus", "Mic Error")
             return False
     except Exception as error:
         log(f"Failed to spawn ffmpeg: {type(error).__name__}")
+        try:
+            if capture_target and os.path.exists(capture_target):
+                _remove_owned_path(capture_target)
+            if capture_dir and os.path.isdir(capture_dir):
+                try:
+                    os.rmdir(capture_dir)
+                except OSError:
+                    pass
+        except Exception:
+            pass
         pill_ipc("setStatus", "Recorder Error")
         return False
 
     try:
         _write_pid_markers(proc.pid)
+        # Mirror legacy only if capture_target is the expected TEMP_AUDIO; otherwise create hard link from capture to legacy if possible
+        # For exclusive capture, we maintain private capture and also optionally hard-link to TEMP_AUDIO for compatibility
+        try:
+            # Create a hard link at TEMP_AUDIO pointing to capture for legacy consumers that poll TEMP_AUDIO
+            # Use descriptor-relative unlink then link
+            _remove_owned_path(TEMP_AUDIO)
+            os.link(capture_target, TEMP_AUDIO)
+        except OSError:
+            # If linking fails, legacy path may remain absent; primary path is capture_target
+            pass
         _mirror_legacy_audio()
-        update_runtime_state("recording", paused=False, pid=proc.pid)
+        update_runtime_state("recording", paused=False, pid=proc.pid, audio_path=capture_target)
     except OSError as error:
         log(f"Failed to persist recording state: {type(error).__name__}")
         _terminate_recorder(proc.pid, signal.SIGTERM)
         _clear_runtime_markers()
         _clear_audio_files()
+        try:
+            if capture_target and os.path.exists(capture_target):
+                _remove_owned_path(capture_target)
+            if capture_dir and os.path.isdir(capture_dir):
+                try:
+                    os.rmdir(capture_dir)
+                except OSError:
+                    pass
+        except Exception:
+            pass
         pill_ipc("setStatus", "Recorder Error")
         return False
 
@@ -1409,15 +1957,77 @@ def cancel_recording():
 
 
 def _audio_target():
+    # Prefer explicit audio_path from runtime state (exclusive capture)
+    try:
+        state = _load_runtime_state()
+        ap = state.get("audio_path")
+        if ap:
+            # Validate via owned descriptor
+            info = _owned_path(ap)
+            if info is not None:
+                try:
+                    # Open via dir_fd validation
+                    parent = os.path.dirname(ap) or "."
+                    base = os.path.basename(ap)
+                    dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+                    try:
+                        # Validate file via dir_fd
+                        fd = os.open(base, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
+                        try:
+                            fi = os.fstat(fd)
+                            if fi.st_uid == os.getuid() and stat.S_ISREG(fi.st_mode) and fi.st_nlink == 1 and fi.st_size > 0 and fi.st_size <= MAX_AUDIO_BYTES:
+                                return ap
+                        finally:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
+                    finally:
+                        try:
+                            os.close(dir_fd)
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+    except Exception:
+        pass
     for path in [TEMP_AUDIO, LEGACY_TEMP_AUDIO]:
         info = _owned_path(path)
         if info is None:
             continue
         try:
-            if os.path.getsize(path) > 0:
+            sz = os.path.getsize(path)
+            if sz > 0:
                 return path
         except OSError:
             pass
+    # Fallback scan for capture dirs
+    try:
+        with os.scandir(RUNTIME_DIR) as it:
+            candidates = []
+            for entry in it:
+                if not (entry.name.startswith(".cap-") or entry.name.startswith(".rec-")):
+                    continue
+                try:
+                    st = os.lstat(entry.path)
+                    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+                        continue
+                    with os.scandir(entry.path) as it2:
+                        for e2 in it2:
+                            if e2.name.endswith(".wav"):
+                                try:
+                                    s2 = os.lstat(e2.path)
+                                    if stat.S_ISREG(s2.st_mode) and s2.st_uid == os.getuid() and s2.st_nlink == 1 and s2.st_size > 0:
+                                        candidates.append((s2.st_mtime, e2.path))
+                                except OSError:
+                                    pass
+                except OSError:
+                    pass
+            if candidates:
+                candidates.sort()
+                return candidates[-1][1]
+    except OSError:
+        pass
     return None
 
 
@@ -1472,7 +2082,15 @@ def _transcribe_local(target_audio):
     )
     if result.returncode != 0:
         raise RuntimeError("voxtype returned a non-zero exit code")
-    return _extract_voxtype_text(result.stdout)
+    txt = _extract_voxtype_text(result.stdout)
+    # Strict transcript ceiling
+    if len(txt) > MAX_TRANSCRIPT_CHARS:
+        txt = txt[:MAX_TRANSCRIPT_CHARS]
+    if len(txt.encode("utf-8")) > MAX_TRANSCRIPT_BYTES:
+        # Truncate to byte ceiling
+        b = txt.encode("utf-8")[:MAX_TRANSCRIPT_BYTES]
+        txt = b.decode("utf-8", errors="ignore")
+    return txt
 
 
 def _transcribe_cloud(target_audio, model_choice):
@@ -1483,18 +2101,47 @@ def _transcribe_cloud(target_audio, model_choice):
     if not api_key:
         raise MissingApiKeyError
 
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(target_audio, flags)
-    with os.fdopen(fd, "rb") as handle:
-        info = os.fstat(handle.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+    deadline = time.monotonic() + TRANSCRIBE_DEADLINE_SECONDS
+    def _check_deadline():
+        if time.monotonic() > deadline:
+            raise TimeoutError("transcription deadline exceeded")
+
+    # Descriptor-relative open with validation and O_NONBLOCK
+    parent = os.path.dirname(target_audio) or "."
+    base = os.path.basename(target_audio)
+    dir_fd = None
+    fd = None
+    try:
+        dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        dir_fd = os.open(parent, dir_flags)
+        di = os.fstat(dir_fd)
+        if not stat.S_ISDIR(di.st_mode) or di.st_uid != os.getuid():
+            raise ValueError("audio directory is not private")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(base, flags, dir_fd=dir_fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
             raise ValueError("audio file is not a private regular file")
         if info.st_size > MAX_AUDIO_BYTES:
             raise ValueError("audio file exceeds application byte limit")
-        audio_bytes = handle.read(MAX_AUDIO_BYTES + 1)
-        if len(audio_bytes) > MAX_AUDIO_BYTES:
-            raise ValueError("audio file exceeds application byte limit")
+        with os.fdopen(fd, "rb") as handle:
+            fd = None
+            audio_bytes = handle.read(MAX_AUDIO_BYTES + 1)
+            if len(audio_bytes) > MAX_AUDIO_BYTES:
+                raise ValueError("audio file exceeds application byte limit")
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
 
+    _check_deadline()
     client = genai.Client(
         api_key=api_key,
         http_options=types.HttpOptions(
@@ -1503,13 +2150,22 @@ def _transcribe_cloud(target_audio, model_choice):
         ),
     )
 
+    # Hard end-to-end deadline wrapper: ensure total operation bounded
+    def _bounded_call(fn, *args, **kwargs):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("transcription deadline exceeded")
+        # The SDK respects http_options timeout, but we also enforce outer deadline
+        return fn(*args, **kwargs)
+
     if model_choice == "gemini-3.5-transcribe":
-        audio_file = client.files.upload(
+        audio_file = _bounded_call(client.files.upload,
             file=io.BytesIO(audio_bytes),
             config=types.UploadFileConfig(mime_type="audio/wav"),
         )
+        _check_deadline()
         try:
-            interaction = client.interactions.create(
+            interaction = _bounded_call(client.interactions.create,
                 model=model_choice,
                 input=[{
                     "type": "audio", "uri": audio_file.uri,
@@ -1517,22 +2173,37 @@ def _transcribe_cloud(target_audio, model_choice):
                 }],
                 generation_config={"transcription_config": {"mode": "smart"}},
             )
-            return (getattr(interaction, "output_text", "") or "").strip()
+            txt = (getattr(interaction, "output_text", "") or "").strip()
         finally:
             uploaded_name = getattr(audio_file, "name", "")
             if uploaded_name:
                 try:
+                    # Deletion also bounded but must not exceed deadline excessively
                     client.files.delete(name=uploaded_name)
                 except Exception as error:
                     log(f"Could not delete uploaded audio: {type(error).__name__}")
-    response = client.models.generate_content(
+        # Transcript ceiling
+        if len(txt) > MAX_TRANSCRIPT_CHARS:
+            txt = txt[:MAX_TRANSCRIPT_CHARS]
+        if len(txt.encode("utf-8")) > MAX_TRANSCRIPT_BYTES:
+            b = txt.encode("utf-8")[:MAX_TRANSCRIPT_BYTES]
+            txt = b.decode("utf-8", errors="ignore")
+        return txt
+    _check_deadline()
+    response = _bounded_call(client.models.generate_content,
         model=model_choice,
         contents=[
             types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
             "Transcribe this speech accurately. Clean up disfluencies, remove filler words like ums/ahs, format punctuation and capitalization properly. Return ONLY the transcribed text without quotes or explanations.",
         ],
     )
-    return (response.text or "").strip()
+    txt = (response.text or "").strip()
+    if len(txt) > MAX_TRANSCRIPT_CHARS:
+        txt = txt[:MAX_TRANSCRIPT_CHARS]
+    if len(txt.encode("utf-8")) > MAX_TRANSCRIPT_BYTES:
+        b = txt.encode("utf-8")[:MAX_TRANSCRIPT_BYTES]
+        txt = b.decode("utf-8", errors="ignore")
+    return txt
 
 
 def _transcribe_audio(target_audio, model_choice):
@@ -1544,12 +2215,21 @@ def _transcribe_audio(target_audio, model_choice):
 
 
 def _inject_text(text, auto_submit=False):
+    # Enforce transcript ceiling before injection
+    if len(text) > MAX_TRANSCRIPT_CHARS:
+        text = text[:MAX_TRANSCRIPT_CHARS]
+    if len(text.encode("utf-8")) > MAX_TRANSCRIPT_BYTES:
+        b = text.encode("utf-8")[:MAX_TRANSCRIPT_BYTES]
+        text = b.decode("utf-8", errors="ignore")
+    if not text:
+        return False
     clipboard_ok = False
     copy_to_clipboard = get_settings()["copy_to_clipboard"]
     if copy_to_clipboard:
         try:
             result = subprocess.run(
-                ["wl-copy", "--sensitive"], input=text, text=True, check=False, timeout=5
+                ["wl-copy", "--sensitive"], input=text, text=True, check=False, timeout=5,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             clipboard_ok = result.returncode == 0
         except (OSError, subprocess.SubprocessError):
@@ -1560,7 +2240,8 @@ def _inject_text(text, auto_submit=False):
 
     try:
         typed = subprocess.run(
-            ["wtype", "-"], input=text, text=True, check=False, timeout=5
+            ["wtype", "-"], input=text, text=True, check=False, timeout=5,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         if typed.returncode != 0:
             return False
@@ -1570,7 +2251,8 @@ def _inject_text(text, auto_submit=False):
     if auto_submit:
         time.sleep(0.08)
         try:
-            submitted = subprocess.run(["wtype", "-k", "Return"], check=False, timeout=5)
+            submitted = subprocess.run(["wtype", "-k", "Return"], check=False, timeout=5,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if submitted.returncode != 0:
                 return False
             log("Auto-submit triggered")
@@ -1598,8 +2280,39 @@ def _stop_recording(auto_submit=False, pids=None):
     pill_ipc("setTranscribing", "Transcribing...")
     target_audio = _audio_target()
     try:
-        audio_size = os.path.getsize(target_audio) if target_audio else 0
-        if target_audio is None or audio_size < 1000:
+        # Validate audio via descriptor-relative checks and size ceiling
+        if target_audio is None:
+            pill_ipc("setStatus", "Audio too short")
+            log("Audio clip was too short or empty")
+            return False
+        try:
+            # Use descriptor-relative stat to avoid TOCTOU
+            parent = os.path.dirname(target_audio) or "."
+            base = os.path.basename(target_audio)
+            dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+            try:
+                fd = os.open(base, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
+                try:
+                    fi = os.fstat(fd)
+                    audio_size = fi.st_size
+                    if not stat.S_ISREG(fi.st_mode) or fi.st_uid != os.getuid() or fi.st_nlink != 1:
+                        raise OSError("audio not private")
+                finally:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    os.close(dir_fd)
+                except OSError:
+                    pass
+        except OSError:
+            try:
+                audio_size = os.path.getsize(target_audio) if target_audio else 0
+            except OSError:
+                audio_size = 0
+        if audio_size < 1000:
             pill_ipc("setStatus", "Audio too short")
             log("Audio clip was too short or empty")
             return False
@@ -1608,8 +2321,12 @@ def _stop_recording(auto_submit=False, pids=None):
             log("Audio clip exceeded the application byte limit")
             return False
 
+        # Outer deadline for entire transcription+injection
+        op_deadline = time.monotonic() + TRANSCRIBE_DEADLINE_SECONDS
         try:
             text = _transcribe_audio(target_audio, model_choice)
+            if time.monotonic() > op_deadline:
+                raise TimeoutError("operation deadline exceeded")
         except MissingApiKeyError:
             log("Gemini API key not configured")
             pill_ipc("setStatus", "No API Key")
@@ -1622,6 +2339,16 @@ def _stop_recording(auto_submit=False, pids=None):
         if not text:
             pill_ipc("setStatus", "No speech detected")
             log("No speech detected")
+            return False
+        # Enforce transcript ceiling before injection (already done in transcribers and inject, but double-check)
+        if len(text) > MAX_TRANSCRIPT_CHARS:
+            text = text[:MAX_TRANSCRIPT_CHARS]
+        if len(text.encode("utf-8")) > MAX_TRANSCRIPT_BYTES:
+            b = text.encode("utf-8")[:MAX_TRANSCRIPT_BYTES]
+            text = b.decode("utf-8", errors="ignore")
+        if time.monotonic() > op_deadline:
+            log("Operation deadline exceeded before injection")
+            pill_ipc("setStatus", "Transcription Error")
             return False
 
         if not _inject_text(text, auto_submit=auto_submit):

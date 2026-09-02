@@ -121,6 +121,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         elide: Text.ElideRight
+        textFormat: Text.PlainText
       }
 
       Text {
@@ -230,6 +231,7 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               elide: Text.ElideRight
+              textFormat: Text.PlainText
             }
 
             MouseArea {

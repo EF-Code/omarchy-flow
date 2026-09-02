@@ -35,13 +35,29 @@ Item {
     onRunningChanged: {
       if (!running) Qt.callLater(root.runNextAction)
     }
+    Component.onDestruction: if (running) running = false
+  }
+
+  Timer {
+    id: actionWatchdog
+    interval: 10000
+    running: actionProcess.running
+    onTriggered: actionProcess.running = false
   }
 
   // Upgrade only an existing Flow-managed block. This never installs
   // shortcuts for users who have not opted into them.
   Process {
+    id: migrateProcess
     command: [root.flowctlPath, "migrate-hotkeys"]
     running: true
+    Component.onDestruction: if (running) running = false
+  }
+
+  Timer {
+    interval: 5000
+    running: migrateProcess.running
+    onTriggered: migrateProcess.running = false
   }
 
   IpcHandler {

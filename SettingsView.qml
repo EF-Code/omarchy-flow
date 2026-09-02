@@ -229,10 +229,14 @@ Item {
     onExited: function(exitCode) {
       if (exitCode !== 0 || !settingsOutput.text) return
       try {
-        root.applySettings(JSON.parse(settingsOutput.text.trim()))
+        var raw = settingsOutput.text
+        if (raw.length > 8192) raw = raw.slice(0, 8192)
+        root.applySettings(JSON.parse(raw.trim()))
       } catch (e) {}
     }
+    Component.onDestruction: if (running) running = false
   }
+  Timer { interval: 5000; running: settingsProcess.running; onTriggered: settingsProcess.running = false }
 
   Process {
     id: settingsWriteProcess
@@ -244,7 +248,9 @@ Item {
       else root.notice = "Could not save preference"
       Qt.callLater(root.runNextSettingWrite)
     }
+    Component.onDestruction: if (running) running = false
   }
+  Timer { interval: 5000; running: settingsWriteProcess.running; onTriggered: settingsWriteProcess.running = false }
 
   Process {
     id: audioSourcesProcess
@@ -256,15 +262,25 @@ Item {
     onExited: function(exitCode) {
       if (exitCode !== 0 || !audioSourcesOutput.text) return
       try {
-        var sources = JSON.parse(audioSourcesOutput.text.trim())
+        var raw = audioSourcesOutput.text
+        if (raw.length > 8192) raw = raw.slice(0, 8192)
+        var sources = JSON.parse(raw.trim())
+        if (!Array.isArray(sources)) return
+        if (sources.length > 32) sources = sources.slice(0, 32)
         var mapped = []
         for (var i = 0; i < sources.length; i++) {
-          mapped.push({ value: String(sources[i].id), label: String(sources[i].name) })
+          var sid = String(sources[i].id)
+          var sname = String(sources[i].name)
+          if (sid.length > 256) sid = sid.slice(0, 256)
+          if (sname.length > 256) sname = sname.slice(0, 256)
+          mapped.push({ value: sid, label: sname })
         }
         if (mapped.length > 0) root.audioOptions = mapped
       } catch (e) {}
     }
+    Component.onDestruction: if (running) running = false
   }
+  Timer { interval: 5000; running: audioSourcesProcess.running; onTriggered: audioSourcesProcess.running = false }
 
   Process {
     id: hotkeyStatusProcess
@@ -276,13 +292,25 @@ Item {
     onExited: function(exitCode) {
       if (exitCode !== 0 || !hotkeyStatusOutput.text) return
       try {
-        var status = JSON.parse(hotkeyStatusOutput.text.trim())
+        var raw = hotkeyStatusOutput.text
+        if (raw.length > 8192) raw = raw.slice(0, 8192)
+        var status = JSON.parse(raw.trim())
         root.hotkeysInstalled = status.installed === true
-        root.hotkeyConflicts = status.conflicts || []
+        var conflicts = status.conflicts || []
+        if (!Array.isArray(conflicts)) conflicts = []
+        if (conflicts.length > 32) conflicts = conflicts.slice(0, 32)
+        // Bound each entry's strings
+        for (var i = 0; i < conflicts.length; i++) {
+          if (conflicts[i].shortcut && String(conflicts[i].shortcut).length > 128) conflicts[i].shortcut = String(conflicts[i].shortcut).slice(0,128)
+          if (conflicts[i].description && String(conflicts[i].description).length > 256) conflicts[i].description = String(conflicts[i].description).slice(0,256)
+        }
+        root.hotkeyConflicts = conflicts
         if (status.hotkeys) root.hotkeys = status.hotkeys
       } catch (e) {}
     }
+    Component.onDestruction: if (running) running = false
   }
+  Timer { interval: 5000; running: hotkeyStatusProcess.running; onTriggered: hotkeyStatusProcess.running = false }
 
   Process {
     id: hotkeyApplyProcess
@@ -300,20 +328,30 @@ Item {
         root.hotkeysInstalled = true
         root.notice = "Shortcuts applied · Hyprland reloaded"
         try {
-          var status = JSON.parse(hotkeyApplyOutput.text.trim())
+          var raw = hotkeyApplyOutput.text
+          if (raw.length > 8192) raw = raw.slice(0, 8192)
+          var status = JSON.parse(raw.trim())
           if (status.hotkeys) root.hotkeys = status.hotkeys
-          root.hotkeyConflicts = status.conflicts || []
+          var conflicts = status.conflicts || []
+          if (!Array.isArray(conflicts)) conflicts = []
+          if (conflicts.length > 32) conflicts = conflicts.slice(0, 32)
+          root.hotkeyConflicts = conflicts
         } catch (e) {}
       } else {
-        root.notice = hotkeyApplyError.text ? "Could not apply shortcuts · check for conflicts" : "Could not apply shortcuts"
+        var err = hotkeyApplyError.text
+        if (err && err.length > 512) err = err.slice(0,512)
+        root.notice = err ? "Could not apply shortcuts · check for conflicts" : "Could not apply shortcuts"
         root.loadHotkeyStatus()
       }
     }
+    Component.onDestruction: if (running) running = false
   }
+  Timer { interval: 8000; running: hotkeyApplyProcess.running; onTriggered: hotkeyApplyProcess.running = false }
 
   Process {
     id: hotkeyRemoveProcess
     command: [root.flowctlPath, "remove-hotkeys"]
+    stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode === 0) {
@@ -325,7 +363,9 @@ Item {
         root.loadHotkeyStatus()
       }
     }
+    Component.onDestruction: if (running) running = false
   }
+  Timer { interval: 8000; running: hotkeyRemoveProcess.running; onTriggered: hotkeyRemoveProcess.running = false }
 
   Process {
     id: doctorProcess
@@ -337,11 +377,22 @@ Item {
     onExited: function(exitCode) {
       if (exitCode !== 0 || !doctorOutput.text) return
       try {
-        var report = JSON.parse(doctorOutput.text.trim())
-        root.diagnosticChecks = report.checks || []
+        var raw = doctorOutput.text
+        if (raw.length > 16384) raw = raw.slice(0, 16384)
+        var report = JSON.parse(raw.trim())
+        var checks = report.checks || []
+        if (!Array.isArray(checks)) checks = []
+        if (checks.length > 32) checks = checks.slice(0, 32)
+        for (var i = 0; i < checks.length; i++) {
+          if (checks[i].label && String(checks[i].label).length > 128) checks[i].label = String(checks[i].label).slice(0,128)
+          if (checks[i].detail && String(checks[i].detail).length > 512) checks[i].detail = String(checks[i].detail).slice(0,512)
+        }
+        root.diagnosticChecks = checks
       } catch (e) {}
     }
+    Component.onDestruction: if (running) running = false
   }
+  Timer { interval: 8000; running: doctorProcess.running; onTriggered: doctorProcess.running = false }
 
   Process {
     id: audioTestProcess
@@ -352,35 +403,48 @@ Item {
     }
     onExited: function(exitCode) {
       try {
-        var result = JSON.parse(audioTestOutput.text.trim())
-        root.audioTestResult = result.message || (exitCode === 0 ? "Microphone capture works" : "Microphone capture failed")
+        var raw = audioTestOutput.text
+        if (raw && raw.length > 4096) raw = raw.slice(0,4096)
+        var result = JSON.parse(raw.trim())
+        var msg = result.message || (exitCode === 0 ? "Microphone capture works" : "Microphone capture failed")
+        if (msg.length > 512) msg = msg.slice(0,512)
+        root.audioTestResult = msg
       } catch (e) {
         root.audioTestResult = exitCode === 0 ? "Microphone capture works" : "Microphone capture failed"
       }
     }
+    Component.onDestruction: if (running) running = false
   }
+  Timer { interval: 8000; running: audioTestProcess.running; onTriggered: audioTestProcess.running = false }
 
   Process {
     id: resetProcess
     command: [root.flowctlPath, "reset-settings"]
     stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode === 0) {
         root.notice = "Flow preferences restored"
         settingsProcess.running = true
       } else root.notice = "Could not reset preferences"
     }
+    Component.onDestruction: if (running) running = false
   }
+  Timer { interval: 8000; running: resetProcess.running; onTriggered: resetProcess.running = false }
 
   Process {
     id: keybindingsProcess
     command: ["omarchy", "menu", "keybindings"]
+    Component.onDestruction: if (running) running = false
   }
+  Timer { interval: 5000; running: keybindingsProcess.running; onTriggered: keybindingsProcess.running = false }
 
   Process {
     id: projectProcess
     command: ["xdg-open", "https://github.com/EF-Code/omarchy-flow"]
+    Component.onDestruction: if (running) running = false
   }
+  Timer { interval: 5000; running: projectProcess.running; onTriggered: projectProcess.running = false }
 
   Flickable {
     id: settingsFlickable
@@ -456,6 +520,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
       }
     }
   }
@@ -727,6 +792,7 @@ Item {
                 font.pixelSize: Style.font.bodySmall
                 font.bold: true
                 elide: Text.ElideRight
+                textFormat: Text.PlainText
               }
 
               Text {
@@ -736,6 +802,7 @@ Item {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
+                textFormat: Text.PlainText
               }
             }
 
@@ -777,6 +844,8 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
           }
         }
       }
@@ -1074,6 +1143,7 @@ Item {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
                   elide: Text.ElideRight
+                  textFormat: Text.PlainText
                 }
 
                 Text {
@@ -1083,6 +1153,7 @@ Item {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideRight
+                  textFormat: Text.PlainText
                 }
               }
             }
@@ -1133,6 +1204,7 @@ Item {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
       }
     }
   }

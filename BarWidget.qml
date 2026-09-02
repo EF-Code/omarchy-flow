@@ -88,6 +88,14 @@ BarWidget {
         root.refreshStatus()
       }
     }
+    Component.onDestruction: if (running) running = false
+  }
+
+  Timer {
+    id: actionWatchdog
+    interval: 10000
+    running: actionProcess.running
+    onTriggered: actionProcess.running = false
   }
 
   Process {
@@ -100,13 +108,31 @@ BarWidget {
     onExited: function(exitCode) {
       if (exitCode === 0 && statusOut.text) {
         try {
-          var data = JSON.parse(statusOut.text.trim())
+          var raw = statusOut.text
+          if (raw.length > 8192) raw = raw.slice(0, 8192)
+          var data = JSON.parse(raw.trim())
+          if (typeof data !== "object" || data === null) return
           root.isRecording = data.recording === true
           root.isPaused = data.paused === true
-          if (data.model) root.selectedModel = data.model
+          if (data.model && typeof data.model === "string" && data.model.length < 256) {
+            // Only accept known model ids
+            for (var i = 0; i < root.modelOptions.length; i++) {
+              if (root.modelOptions[i].id === data.model) {
+                root.selectedModel = data.model
+                break
+              }
+            }
+          }
         } catch (e) {}
       }
     }
+    Component.onDestruction: if (running) running = false
+  }
+
+  Timer {
+    interval: 5000
+    running: statusProcess.running
+    onTriggered: statusProcess.running = false
   }
 
   Timer {
@@ -187,6 +213,7 @@ BarWidget {
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.subtitle
             font.bold: true
+            textFormat: Text.PlainText
           }
 
           Text {
@@ -196,6 +223,7 @@ BarWidget {
             color: menuPopup.mutedForeground
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.caption
+            textFormat: Text.PlainText
           }
         }
       }
@@ -208,6 +236,7 @@ BarWidget {
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.caption
         font.bold: true
+        textFormat: Text.PlainText
       }
 
       Column {
@@ -255,6 +284,7 @@ BarWidget {
                   font.pixelSize: Style.font.body
                   font.bold: modelRow.selected
                   elide: Text.ElideRight
+                  textFormat: Text.PlainText
                 }
 
                 Text {
@@ -264,6 +294,7 @@ BarWidget {
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideRight
+                  textFormat: Text.PlainText
                 }
               }
 
@@ -280,6 +311,7 @@ BarWidget {
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
                   font.pixelSize: Style.font.body
                   font.bold: true
+                  textFormat: Text.PlainText
                 }
               }
             }
@@ -304,6 +336,7 @@ BarWidget {
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.caption
         font.bold: true
+        textFormat: Text.PlainText
       }
 
       Row {
@@ -368,6 +401,7 @@ BarWidget {
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
       }
 
       Button {
