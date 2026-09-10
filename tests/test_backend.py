@@ -133,7 +133,7 @@ class TestFlowBackend(unittest.TestCase):
             [
                 "whisper-base.en",
                 "gemini-3.5-transcribe",
-                "gemini-3.7-flash",
+                "gemini-3.8-flash",
             ],
         )
 
@@ -373,6 +373,15 @@ class TestFlowBackend(unittest.TestCase):
         self.assertEqual(data["pid"], 12345)
         self.assertEqual(file_mode(backend.STATE_FILE), 0o600)
 
+    def test_runtime_model_is_pinned_across_pause_updates(self):
+        backend.update_runtime_state(
+            "recording", paused=False, pid=12345, model="gemini-3.5-transcribe"
+        )
+        with patch.object(backend, "get_selected_model", return_value="gemini-3.8-flash"):
+            backend.update_runtime_state("paused", paused=True, pid=12345)
+        data = json.loads(Path(backend.STATE_FILE).read_text())
+        self.assertEqual(data["model"], "gemini-3.5-transcribe")
+
     def test_legacy_pid_marker_failure_does_not_block_recording_state(self):
         original_write = backend._write_private_text
 
@@ -462,7 +471,7 @@ class TestFlowBackend(unittest.TestCase):
     def test_flowctl_uses_isolated_xdg_state_and_validates_arguments(self):
         flowctl = REPO_ROOT / "scripts" / "flowctl"
         set_result = subprocess.run(
-            [str(flowctl), "model", "gemini-3.7-flash"],
+            [str(flowctl), "model", "gemini-3.8-flash"],
             env=self.child_env,
             capture_output=True,
             text=True,
@@ -475,7 +484,7 @@ class TestFlowBackend(unittest.TestCase):
             text=True,
         )
         self.assertEqual(get_result.returncode, 0, get_result.stderr)
-        self.assertEqual(get_result.stdout.strip(), "gemini-3.7-flash")
+        self.assertEqual(get_result.stdout.strip(), "gemini-3.8-flash")
 
         invalid = subprocess.run(
             [str(flowctl), "model", "unsupported", "extra"],
@@ -623,6 +632,18 @@ class TestFlowBackend(unittest.TestCase):
         descendant = int(pid_file.read_text())
         self.assertFalse(process_is_running(descendant))
 
+    def test_captured_timeout_kills_reparented_nested_pipe_holder(self):
+        pid_file = Path(self.temp_dir.name) / "reparented-nested-session.pid"
+        command = [
+            sys.executable, "-c",
+            "import pathlib,subprocess; "
+            f"p=subprocess.Popen(['sleep','30'],start_new_session=True); pathlib.Path({str(pid_file)!r}).write_text(str(p.pid))",
+        ]
+        with self.assertRaises(subprocess.TimeoutExpired):
+            backend._run_captured(command, timeout=0.3, max_output_bytes=1024)
+        descendant = int(pid_file.read_text())
+        self.assertFalse(process_is_running(descendant))
+
     def test_cloud_deadline_kills_blocked_worker(self):
         audio = Path(backend.TEMP_AUDIO)
         audio.write_bytes(b"R" * 1200)
@@ -743,6 +764,38 @@ class TestFlowBackend(unittest.TestCase):
             self.assertTrue(backend._stop_recording())
         transcribe.assert_called_once_with(backend.TEMP_AUDIO, backend.DEFAULT_MODEL_ID)
         self.assertFalse(Path(backend.TEMP_AUDIO).exists())
+
+    def test_stop_uses_model_pinned_when_recording_started(self):
+        Path(backend.TEMP_AUDIO).write_bytes(b"R" * 1200)
+        backend.update_runtime_state(
+            "recording", paused=False, pid=4242, model="gemini-3.5-transcribe"
+        )
+        with patch.object(backend, "get_selected_model", return_value="gemini-3.8-flash"), patch.object(
+            backend, "_terminate_recorder", return_value=True
+        ), patch.object(
+            backend, "_transcribe_audio", return_value="pinned text"
+        ) as transcribe, patch.object(
+            backend, "_inject_text", return_value=True
+        ), patch.object(backend, "pill_ipc"):
+            self.assertTrue(backend._stop_recording(pids=[4242]))
+        transcribe.assert_called_once_with(backend.TEMP_AUDIO, "gemini-3.5-transcribe")
+
+    def test_stop_resolves_exclusive_capture_before_clearing_state(self):
+        target, _capture_dir, capture_fd = backend._create_exclusive_capture_target()
+        os.write(capture_fd, b"R" * 1200)
+        os.close(capture_fd)
+        backend.update_runtime_state(
+            "recording", paused=False, pid=4242, audio_path=target,
+            model="whisper-base.en",
+        )
+        with patch.object(backend, "_terminate_recorder", return_value=True), patch.object(
+            backend, "_transcribe_audio", return_value="exclusive text"
+        ) as transcribe, patch.object(
+            backend, "_inject_text", return_value=True
+        ), patch.object(backend, "pill_ipc"):
+            self.assertTrue(backend._stop_recording(pids=[4242]))
+        transcribe.assert_called_once_with(target, "whisper-base.en")
+        self.assertFalse(Path(target).exists())
 
     def test_status_poll_preserves_completed_capped_recording(self):
         Path(backend.TEMP_AUDIO).write_bytes(b"R" * 1200)
@@ -873,6 +926,12 @@ class TestFlowBackend(unittest.TestCase):
         self.assertIn('onClicked: root.closeAfterAction("stop")', transcribe_button[:500])
         self.assertIn('root.stateMode = "status"', pill)
         self.assertIn('if (root.stateMode === "status") return root.statusText', pill)
+        self.assertIn('function refreshModel(): string', pill)
+        self.assertIn('return geminiHandler.refreshModel()', pill)
+        self.assertNotIn('function setModel(modelId: string)', pill)
+        self.assertIn('pill_ipc("refreshModel")', (REPO_ROOT / "scripts" / "gemini-dictate.py").read_text())
+        self.assertNotIn('root.selectedModel = modelData.id\n                                    saveModelProcess.save', pill)
+        self.assertIn('if (!loadModelProcess.running && !saveModelProcess.running)', pill)
         self.assertIn("property var actionQueue", service)
         self.assertIn('return "queued"', service)
         self.assertIn('command: [root.flowctlPath, "qml", "migrate-hotkeys"]', service)
@@ -881,6 +940,9 @@ class TestFlowBackend(unittest.TestCase):
         self.assertIn('command: [root.flowctlPath, "qml", "remove-hotkeys"]', settings)
         for source in [bar, pill, service, settings]:
             self.assertIn('root.flowctlPath, "qml"', source)
+        for source in [bar, pill, settings, (REPO_ROOT / "scripts" / "gemini-dictate.py").read_text()]:
+            self.assertIn("gemini-3.8-flash", source)
+            self.assertNotIn("gemini-3.7-flash", source)
 
     def test_qml_flowctl_caps_producer_output(self):
         noisy = [

@@ -40,7 +40,7 @@ Item {
   readonly property var modelOptions: [
     { value: "whisper-base.en", label: "Local Whisper (base.en)" },
     { value: "gemini-3.5-transcribe", label: "Gemini 3.5 Transcribe" },
-    { value: "gemini-3.7-flash", label: "Gemini 3.7 Flash" }
+    { value: "gemini-3.8-flash", label: "Gemini 3.8 Flash" }
   ]
 
   readonly property var hotkeyDefinitions: [

@@ -45,7 +45,7 @@ shortcuts.
 | --- | --- | --- |
 | `whisper-base.en` | Voxtype and Whisper | Local, offline English transcription with `base.en` |
 | `gemini-3.5-transcribe` | Google Gemini API | Cloud transcription through the Interactions API |
-| `gemini-3.7-flash` | Google Gemini API | Cloud transcription through content generation |
+| `gemini-3.8-flash` | Google Gemini API | Cloud transcription through content generation |
 
 Flow accepts only these model IDs. Other Gemini models, API providers, and
 local model IDs are not currently supported.

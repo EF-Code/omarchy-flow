@@ -123,7 +123,7 @@ LOCAL_VOXTYPE_MODEL = "base.en"
 SUPPORTED_MODELS = [
     {"id": LOCAL_MODEL_ID, "name": "Local Whisper (base.en)", "desc": "Local • Offline", "provider": "local"},
     {"id": "gemini-3.5-transcribe", "name": "Gemini 3.5 Transcribe", "desc": "Cloud • Dedicated transcription", "provider": "gemini"},
-    {"id": "gemini-3.7-flash", "name": "Gemini 3.7 Flash", "desc": "Cloud • Speech transcription", "provider": "gemini"},
+    {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash", "desc": "Cloud • Speech transcription", "provider": "gemini"},
 ]
 
 DEFAULT_MODEL_ID = SUPPORTED_MODELS[0]["id"]
@@ -216,10 +216,11 @@ def _process_group_exists(pgid):
         return True
 
 
-def _descendant_pidfds(root_pid):
+def _descendant_pidfds(root_pid, pinned=None):
     """Snapshot same-UID descendants and pin identities against PID reuse."""
+    pinned = {} if pinned is None else pinned
     if not hasattr(os, "pidfd_open"):
-        return []
+        return pinned
     children = {}
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -241,28 +242,91 @@ def _descendant_pidfds(root_pid):
         pid = pending.pop()
         descendants.append(pid)
         pending.extend(children.get(pid, []))
-    pidfds = []
     for pid in descendants:
+        if pid in pinned:
+            continue
         try:
-            pidfds.append(os.pidfd_open(pid))
+            pinned[pid] = os.pidfd_open(pid)
         except OSError:
             pass
-    return pidfds
+    return pinned
+
+
+def _pipe_holder_pidfds(streams, pinned=None):
+    """Pin same-UID processes retaining either captured pipe endpoint."""
+    pinned = {} if pinned is None else pinned
+    if not hasattr(os, "pidfd_open"):
+        return pinned
+    pipe_targets = set()
+    for stream in streams:
+        try:
+            target = os.readlink(f"/proc/self/fd/{stream.fileno()}")
+            if target.startswith("pipe:["):
+                pipe_targets.add(target)
+        except OSError:
+            pass
+    if not pipe_targets:
+        return pinned
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid in pinned or pid == os.getpid():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+                continue
+            for fd_name in os.listdir(f"/proc/{pid}/fd"):
+                try:
+                    if os.readlink(f"/proc/{pid}/fd/{fd_name}") in pipe_targets:
+                        pinned[pid] = os.pidfd_open(pid)
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return pinned
 
 
 def _signal_pidfds(pidfds, sig):
     if not hasattr(signal, "pidfd_send_signal"):
         return
-    for pidfd in pidfds:
+    for pidfd in pidfds.values():
         try:
             signal.pidfd_send_signal(pidfd, sig)
         except OSError:
             pass
 
 
-def _stop_captured_process_group(process, pgid):
+def _wait_pidfds(pidfds, timeout):
+    """Wait boundedly for pinned processes to exit after signaling."""
+    if not pidfds:
+        return
+    selector = selectors.DefaultSelector()
+    try:
+        for pidfd in pidfds.values():
+            try:
+                selector.register(pidfd, selectors.EVENT_READ)
+            except OSError:
+                pass
+        deadline = time.monotonic() + timeout
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            for key, _ in selector.select(remaining):
+                try:
+                    selector.unregister(key.fileobj)
+                except Exception:
+                    pass
+    finally:
+        selector.close()
+
+
+def _stop_captured_process_group(process, pgid, streams=(), descendant_pidfds=None):
     """Stop the stored group even when its original leader already exited."""
-    descendant_pidfds = _descendant_pidfds(process.pid)
+    descendant_pidfds = _descendant_pidfds(process.pid, descendant_pidfds)
+    descendant_pidfds = _pipe_holder_pidfds(streams, descendant_pidfds)
     process.poll()  # Reap an already-exited leader without losing the stored pgid.
     _kill_process_group(pgid, signal.SIGTERM)
     _signal_pidfds(descendant_pidfds, signal.SIGTERM)
@@ -275,12 +339,13 @@ def _stop_captured_process_group(process, pgid):
         while _process_group_exists(pgid) and time.monotonic() < kill_deadline:
             time.sleep(0.01)
     _signal_pidfds(descendant_pidfds, signal.SIGKILL)
+    _wait_pidfds(descendant_pidfds, WATCHDOG_GRACE_KILL_SECONDS)
     try:
         process.wait(timeout=WATCHDOG_GRACE_KILL_SECONDS)
     except (OSError, subprocess.TimeoutExpired):
         pass
     finally:
-        for pidfd in descendant_pidfds:
+        for pidfd in descendant_pidfds.values():
             try:
                 os.close(pidfd)
             except OSError:
@@ -320,12 +385,14 @@ def _run_captured(args, *, timeout, text=False, env=None,
 
     deadline = time.monotonic() + timeout
     cleanup_attempted = False
+    descendant_pidfds = {}
     try:
         while selector.get_map():
+            _descendant_pidfds(process.pid, descendant_pidfds)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(args, timeout)
-            timeout_for_select = max(0, remaining)
+            timeout_for_select = min(0.05, max(0, remaining))
             # Use small chunk timeout to remain responsive
             try:
                 ready = selector.select(timeout_for_select)
@@ -361,7 +428,7 @@ def _run_captured(args, *, timeout, text=False, env=None,
         except subprocess.TimeoutExpired:
             raise subprocess.TimeoutExpired(args, timeout)
     except BaseException:
-        _stop_captured_process_group(process, pgid)
+        _stop_captured_process_group(process, pgid, streams, descendant_pidfds)
         cleanup_attempted = True
         raise
     finally:
@@ -376,8 +443,16 @@ def _run_captured(args, *, timeout, text=False, env=None,
                 pass
         # Close any inherited pipe ends by ensuring process pipes are closed
         # Reap if still alive
-        if not cleanup_attempted and (process.poll() is None or _process_group_exists(pgid)):
-            _stop_captured_process_group(process, pgid)
+        if not cleanup_attempted and (
+            process.poll() is None or _process_group_exists(pgid) or descendant_pidfds
+        ):
+            _stop_captured_process_group(process, pgid, streams, descendant_pidfds)
+        elif not cleanup_attempted:
+            for pidfd in descendant_pidfds.values():
+                try:
+                    os.close(pidfd)
+                except OSError:
+                    pass
 
     stdout = bytes(streams[process.stdout])
     stderr = bytes(streams[process.stderr])
@@ -1795,7 +1870,7 @@ def _create_exclusive_capture_target():
             pass
         raise
 
-def update_runtime_state(status, paused=False, pid=None, start_ticks=None, audio_path=None):
+def update_runtime_state(status, paused=False, pid=None, start_ticks=None, audio_path=None, model=None):
     if start_ticks is None and pid:
         start_ticks = _process_start_ticks(pid)
     # Persist audio_path if provided or reuse existing
@@ -1806,12 +1881,20 @@ def update_runtime_state(status, paused=False, pid=None, start_ticks=None, audio
                 audio_path = existing
         except Exception:
             pass
+    if model is None:
+        try:
+            existing_model = _load_runtime_state().get("model")
+        except Exception:
+            existing_model = None
+        model = existing_model if existing_model in SUPPORTED_MODEL_IDS else get_selected_model()
+    if model not in SUPPORTED_MODEL_IDS:
+        raise ValueError("unsupported runtime model")
     state_data = {
         "status": status,
         "paused": paused,
         "pid": pid,
         "start_ticks": start_ticks,
-        "model": get_selected_model(),
+        "model": model,
         "timestamp": datetime.datetime.now().isoformat(),
         "audio_path": audio_path,
     }
@@ -1949,7 +2032,10 @@ def _start_recording():
         # Keep the sensitive capture single-linked. Runtime state is the
         # authoritative compatibility boundary; predictable hard-link mirrors
         # would weaken the inode checks used before transcription.
-        update_runtime_state("recording", paused=False, pid=proc.pid, audio_path=capture_target)
+        update_runtime_state(
+            "recording", paused=False, pid=proc.pid, audio_path=capture_target,
+            model=get_selected_model(),
+        )
     except OSError as error:
         log(f"Failed to persist recording state: {type(error).__name__}")
         _terminate_recorder(proc.pid, signal.SIGTERM)
@@ -2503,15 +2589,21 @@ def _stop_recording(auto_submit=False, pids=None):
         _clear_audio_files()
         return False
 
+    recording_state = _load_runtime_state()
+    recording_model = recording_state.get("model")
+    if recording_model not in SUPPORTED_MODEL_IDS:
+        recording_model = get_selected_model()
+    # Resolve the descriptor-validated capture while state still contains its
+    # randomized path; marker cleanup intentionally removes that state.
+    target_audio = _audio_target()
     log(f"Stopping audio recording (auto_submit={auto_submit})")
     _clear_runtime_markers()
     for pid in pids:
         _terminate_recorder(pid, signal.SIGINT)
 
-    model_choice = get_selected_model()
+    model_choice = recording_model
     log(f"Recording finalized; transcribing with model {model_choice}")
     pill_ipc("setTranscribing", "Transcribing...")
-    target_audio = _audio_target()
     try:
         # Validate audio via descriptor-relative checks and size ceiling
         if target_audio is None:
@@ -2693,7 +2785,11 @@ if __name__ == "__main__":
         if not set_selected_model(sys.argv[2]):
             print(f"Error: unsupported model id: {sys.argv[2]}", file=sys.stderr)
             sys.exit(1)
-        print(get_selected_model())
+        selected_model = get_selected_model()
+        # Persist first, then tell any running pill. The pill also polls the
+        # authoritative file so a temporarily unavailable IPC target converges.
+        pill_ipc("refreshModel")
+        print(selected_model)
         success = True
     elif action in ("settings", "get-settings"):
         print(json.dumps(get_settings(), separators=(",", ":")))

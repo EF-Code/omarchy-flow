@@ -30,6 +30,10 @@ If you discover a security vulnerability within Omarchy Flow, please do not open
   resolves a mutable predictable pathname. The capture is discovered via descriptor-validated `audio_path` and strict
   `20 MiB` ceilings. Transcribed text is not written to the Flow log and is
   truncated to `20k` chars / `64 KiB` before any clipboard/typing.
+- The selected transcription model is pinned in private runtime state when a
+  recording starts. Changing settings during an active recording affects the
+  next recording and cannot silently redirect already captured local-mode
+  audio to a cloud model.
 - Transcription uses a hard 90 s end-to-end deadline across credential lookup,
   upload, generation, and cleanup in a killable worker (`60 s` per-request
   `NETWORK_TIMEOUT_MS`, retries disabled); failed upload cleanup is retried in a

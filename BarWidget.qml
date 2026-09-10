@@ -18,7 +18,7 @@ BarWidget {
   readonly property var modelOptions: [
     { id: "whisper-base.en", title: "Local Whisper", subtitle: "base.en · Offline" },
     { id: "gemini-3.5-transcribe", title: "Gemini 3.5 Transcribe", subtitle: "Cloud · Dedicated transcription" },
-    { id: "gemini-3.7-flash", title: "Gemini 3.7 Flash", subtitle: "Cloud · Speech understanding" }
+    { id: "gemini-3.8-flash", title: "Gemini 3.8 Flash", subtitle: "Cloud · Speech understanding" }
   ]
 
   // Per-instance jitter de-syncs concurrent polls when the bar creates one

@@ -29,7 +29,7 @@ Item {
         if (!raw || typeof raw !== "string") return "whisper-base.en"
         var s = raw.trim()
         if (s.length > 64) s = s.slice(0, 64)
-        if (s === "whisper-base.en" || s === "gemini-3.5-transcribe" || s === "gemini-3.7-flash") return s
+        if (s === "whisper-base.en" || s === "gemini-3.5-transcribe" || s === "gemini-3.8-flash") return s
         return "whisper-base.en"
     }
 
@@ -62,6 +62,13 @@ Item {
         onTriggered: loadModelProcess.running = false
     }
 
+    Timer {
+        interval: 3000
+        repeat: true
+        running: true
+        onTriggered: if (!loadModelProcess.running && !saveModelProcess.running) loadModelProcess.running = true
+    }
+
     // Save model process
     Process {
         id: saveModelProcess
@@ -72,6 +79,10 @@ Item {
             command = [root.flowctlPath, "qml", "model", safe]
             running = true
             return "ok"
+        }
+        onExited: function(exitCode) {
+            // Commit display state only from the authoritative persisted value.
+            if (!loadModelProcess.running) loadModelProcess.running = true
         }
         Component.onDestruction: if (running) running = false
     }
@@ -174,6 +185,11 @@ Item {
             return "ok"
         }
 
+        function refreshModel(): string {
+            if (!loadModelProcess.running) loadModelProcess.running = true
+            return "ok"
+        }
+
         function hide(): string {
             hideTimer.stop()
             root.isVisible = false
@@ -195,6 +211,7 @@ Item {
         function setTranscribing(text: string): string { return geminiHandler.setTranscribing(text) }
         function setDone(): string { return geminiHandler.setDone() }
         function setStatus(text: string): string { return geminiHandler.setStatus(text) }
+        function refreshModel(): string { return geminiHandler.refreshModel() }
         function hide(): string { return geminiHandler.hide() }
         function toggle(): string {
             return root.runProcess(toggleProcess)
@@ -300,7 +317,7 @@ Item {
                         model: [
                             { id: "whisper-base.en", title: "Local Whisper", subtitle: "base.en • Offline" },
                             { id: "gemini-3.5-transcribe", title: "Gemini 3.5 Transcribe", subtitle: "Cloud • Dedicated transcription" },
-                            { id: "gemini-3.7-flash", title: "Gemini 3.7 Flash", subtitle: "Cloud • Speech transcription" }
+                            { id: "gemini-3.8-flash", title: "Gemini 3.8 Flash", subtitle: "Cloud • Speech transcription" }
                         ]
 
                         Rectangle {
@@ -356,7 +373,6 @@ Item {
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: {
-                                    root.selectedModel = modelData.id
                                     saveModelProcess.save(modelData.id)
                                     root.dropdownOpen = false
                                 }
@@ -519,7 +535,7 @@ Item {
                                     if (root.stateMode === "transcribing") return "Transcribing..."
                                     if (root.selectedModel === "whisper-base.en") return "Whisper"
                                     if (root.selectedModel === "gemini-3.5-transcribe") return "3.5 Transcribe"
-                                    if (root.selectedModel === "gemini-3.7-flash") return "3.7 Flash"
+                                    if (root.selectedModel === "gemini-3.8-flash") return "3.8 Flash"
                                     return root.selectedModel
                                 }
                                 font.pixelSize: 11
