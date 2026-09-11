@@ -78,6 +78,12 @@ BarWidget {
     if (closeMenus) root.close()
   }
 
+  onMenuOpenChanged: {
+    // Refresh on opening so a selection made from the pill is visible in the
+    // menu immediately, even if it landed between periodic status polls.
+    if (menuOpen) root.refreshStatus()
+  }
+
   function toggleRecording(): bool {
     if (!root.runAction("toggle")) return false
     root.isRecording = !root.isRecording
@@ -140,7 +146,7 @@ BarWidget {
   }
 
   Timer {
-    interval: (root.isRecording ? 1000 : 3000) + root.pollJitter
+    interval: (root.isRecording ? 500 : 750) + root.pollJitter
     repeat: true
     running: true
     onTriggered: {

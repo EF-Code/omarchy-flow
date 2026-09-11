@@ -63,7 +63,7 @@ Item {
     }
 
     Timer {
-        interval: 3000
+        interval: 500
         repeat: true
         running: true
         onTriggered: if (!loadModelProcess.running && !saveModelProcess.running) loadModelProcess.running = true
@@ -373,6 +373,9 @@ Item {
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: {
+                                    // Update this view immediately; the persisted model remains
+                                    // authoritative and the loader rolls this back if saving fails.
+                                    root.selectedModel = root.sanitizedModelId(modelData.id)
                                     saveModelProcess.save(modelData.id)
                                     root.dropdownOpen = false
                                 }

@@ -432,6 +432,17 @@ def _run_captured(args, *, timeout, text=False, env=None,
         cleanup_attempted = True
         raise
     finally:
+        # Inspect retained pipe endpoints before closing our stream objects;
+        # fileno() is unavailable after close.
+        if not cleanup_attempted:
+            pipe_holder_pidfds = _pipe_holder_pidfds(streams)
+            if process.poll() is None or _process_group_exists(pgid) or pipe_holder_pidfds:
+                # On successful completion, detached descendants are allowed
+                # only when they closed the captured pipes (the recorder is
+                # intentionally launched this way). Retained pipe holders are
+                # still terminated so collectors cannot hang indefinitely.
+                _stop_captured_process_group(process, pgid, streams, pipe_holder_pidfds)
+                cleanup_attempted = True
         try:
             selector.close()
         except Exception:
@@ -443,11 +454,13 @@ def _run_captured(args, *, timeout, text=False, env=None,
                 pass
         # Close any inherited pipe ends by ensuring process pipes are closed
         # Reap if still alive
-        if not cleanup_attempted and (
-            process.poll() is None or _process_group_exists(pgid) or descendant_pidfds
-        ):
-            _stop_captured_process_group(process, pgid, streams, descendant_pidfds)
-        elif not cleanup_attempted:
+        if not cleanup_attempted:
+            for pidfd in descendant_pidfds.values():
+                try:
+                    os.close(pidfd)
+                except OSError:
+                    pass
+        else:
             for pidfd in descendant_pidfds.values():
                 try:
                     os.close(pidfd)
@@ -493,7 +506,10 @@ def _read_owned_text(path, max_bytes=MAX_READ_BYTES):
             di = os.fstat(dir_fd)
         except OSError:
             return None
-        if not stat.S_ISDIR(di.st_mode) or di.st_uid != os.getuid() or di.st_nlink < 2:
+        # Directory link counts are filesystem-specific (btrfs commonly
+        # reports 1). The held no-follow fd plus type/owner checks are the
+        # security boundary.
+        if not stat.S_ISDIR(di.st_mode) or di.st_uid != os.getuid():
             return None
         if stat.S_ISLNK(di.st_mode):
             return None
@@ -1304,7 +1320,7 @@ def log(msg):
             di = os.fstat(dir_fd)
         except OSError:
             return
-        if not stat.S_ISDIR(di.st_mode) or di.st_uid != os.getuid() or di.st_nlink < 2:
+        if not stat.S_ISDIR(di.st_mode) or di.st_uid != os.getuid():
             return
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:

@@ -169,6 +169,30 @@ class TestFlowBackend(unittest.TestCase):
         self.assertEqual(Path(backend.LEGACY_MODEL_FILE).read_text().strip(), "gemini-3.5-transcribe")
         self.assertEqual(file_mode(backend.MODEL_FILE), 0o600)
 
+    def test_private_read_accepts_directory_link_count_one(self):
+        path = Path(backend.MODEL_FILE)
+        path.write_text("gemini-3.5-transcribe\n")
+        os.chmod(path, 0o600)
+        real_fstat = backend.os.fstat
+        calls = 0
+
+        def btrfs_like_fstat(fd):
+            nonlocal calls
+            info = real_fstat(fd)
+            calls += 1
+            if calls == 1:
+                return SimpleNamespace(
+                    st_mode=info.st_mode, st_uid=info.st_uid,
+                    st_nlink=1, st_size=info.st_size,
+                )
+            return info
+
+        with patch.object(backend.os, "fstat", side_effect=btrfs_like_fstat):
+            self.assertEqual(
+                backend._read_owned_text(str(path)),
+                "gemini-3.5-transcribe\n",
+            )
+
     def test_invalid_model_is_rejected_and_falls_back(self):
         self.assertFalse(backend.set_selected_model("not-a-real-model"))
         Path(backend.MODEL_FILE).write_text("not-a-real-model\n")
@@ -644,6 +668,27 @@ class TestFlowBackend(unittest.TestCase):
         descendant = int(pid_file.read_text())
         self.assertFalse(process_is_running(descendant))
 
+    def test_captured_success_preserves_detached_child_without_output_pipes(self):
+        pid_file = Path(self.temp_dir.name) / "successful-detached.pid"
+        command = [
+            sys.executable, "-c",
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'], "
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL, "
+            "start_new_session=True); "
+            f"open({str(pid_file)!r},'w').write(str(p.pid))",
+        ]
+        result = backend._run_captured(command, timeout=2, max_output_bytes=1024)
+        self.assertEqual(result.returncode, 0)
+        child_pid = int(pid_file.read_text())
+        try:
+            self.assertTrue(process_is_running(child_pid))
+        finally:
+            try:
+                os.kill(child_pid, 9)
+            except OSError:
+                pass
+
     def test_cloud_deadline_kills_blocked_worker(self):
         audio = Path(backend.TEMP_AUDIO)
         audio.write_bytes(b"R" * 1200)
@@ -930,8 +975,9 @@ class TestFlowBackend(unittest.TestCase):
         self.assertIn('return geminiHandler.refreshModel()', pill)
         self.assertNotIn('function setModel(modelId: string)', pill)
         self.assertIn('pill_ipc("refreshModel")', (REPO_ROOT / "scripts" / "gemini-dictate.py").read_text())
-        self.assertNotIn('root.selectedModel = modelData.id\n                                    saveModelProcess.save', pill)
+        self.assertIn('root.selectedModel = root.sanitizedModelId(modelData.id)', pill)
         self.assertIn('if (!loadModelProcess.running && !saveModelProcess.running)', pill)
+        self.assertIn('if (menuOpen) root.refreshStatus()', bar)
         self.assertIn("property var actionQueue", service)
         self.assertIn('return "queued"', service)
         self.assertIn('command: [root.flowctlPath, "qml", "migrate-hotkeys"]', service)
@@ -955,6 +1001,12 @@ class TestFlowBackend(unittest.TestCase):
             [sys.executable, "-c", "print('{\\\"ok\\\":true}')"]
         )
         self.assertEqual(bounded, b'{"ok":true}\n')
+
+        for _ in range(20):
+            self.assertEqual(
+                backend._run_qml_command([sys.executable, "-c", "print('ok')"]),
+                b"ok\n",
+            )
 
         result = subprocess.run(
             [str(REPO_ROOT / "scripts" / "flowctl"), "qml", "status"],
