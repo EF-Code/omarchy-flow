@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resolve randomized exclusive recording paths before clearing runtime markers, so normal stop/transcribe can consume and then remove the actual captured WAV.
 - Accept secure private directories on filesystems such as btrfs that report a link count of one, and perform captured-child cleanup before closing pipe objects so QML model writes complete normally.
 - Restore tick-to-transcribe by preserving the recorder after a successful bounded QML start (while still killing detached captured-pipe holders), and make model selections update immediately in their originating view while all running pill and settings views rapidly reconcile to the same persisted model.
+- Finalize ffmpeg with `SIGINT` before validating the private WAV, allowing buffered short recordings to write their header and samples before the audio-length check.
 - Harden captured helper execution with process-group and pinned descendant `TERM -> bounded grace -> KILL`, reaping and pipe cleanup on timeout, output overflow, and exceptions.
 - Make private-file handling descriptor-relative (`O_NOFOLLOW`/`O_NONBLOCK` from held private directory, `fstat` owner/type/nlink checks, strict read ceilings, exclusive `renameat`, bounded log rotation and truncation).
 - Replace predictable `recording.wav` reopening with an exclusively created, descriptor-validated inode passed to ffmpeg through `/proc/self/fd`, preserving a seekable finalized WAV without a mutable target race.

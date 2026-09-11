@@ -2609,13 +2609,16 @@ def _stop_recording(auto_submit=False, pids=None):
     recording_model = recording_state.get("model")
     if recording_model not in SUPPORTED_MODEL_IDS:
         recording_model = get_selected_model()
-    # Resolve the descriptor-validated capture while state still contains its
-    # randomized path; marker cleanup intentionally removes that state.
-    target_audio = _audio_target()
     log(f"Stopping audio recording (auto_submit={auto_submit})")
-    _clear_runtime_markers()
     for pid in pids:
         _terminate_recorder(pid, signal.SIGINT)
+
+    # ffmpeg may buffer the WAV header and samples until SIGINT finalizes the
+    # seekable output. Resolve the descriptor-validated capture only after the
+    # recorder exits, but before clearing state that contains its randomized
+    # private path.
+    target_audio = _audio_target()
+    _clear_runtime_markers()
 
     model_choice = recording_model
     log(f"Recording finalized; transcribing with model {model_choice}")

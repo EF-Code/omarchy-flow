@@ -827,13 +827,17 @@ class TestFlowBackend(unittest.TestCase):
 
     def test_stop_resolves_exclusive_capture_before_clearing_state(self):
         target, _capture_dir, capture_fd = backend._create_exclusive_capture_target()
-        os.write(capture_fd, b"R" * 1200)
         os.close(capture_fd)
         backend.update_runtime_state(
             "recording", paused=False, pid=4242, audio_path=target,
             model="whisper-base.en",
         )
-        with patch.object(backend, "_terminate_recorder", return_value=True), patch.object(
+
+        def finalize_recording(_pid, _signal):
+            Path(target).write_bytes(b"R" * 1200)
+            return True
+
+        with patch.object(backend, "_terminate_recorder", side_effect=finalize_recording), patch.object(
             backend, "_transcribe_audio", return_value="exclusive text"
         ) as transcribe, patch.object(
             backend, "_inject_text", return_value=True
