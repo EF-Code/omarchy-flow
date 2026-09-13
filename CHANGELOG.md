@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Reduce cloud transcription latency by sending capped ephemeral audio inline instead of using a three-round-trip File API lifecycle, and use low thinking for speech-only Gemini Flash requests.
+- Prevent Gemini and unrelated environment credentials from reaching external helpers by using a strict child-environment allowlist and trusted absolute system executable paths.
 - Keep the running pill synchronized with authoritative model changes from settings, service IPC, direct CLI use, and its own selector; pin each recording to its start-time privacy mode and replace Gemini 3.7 Flash with stable Gemini 3.8 Flash.
 - Resolve randomized exclusive recording paths before clearing runtime markers, so normal stop/transcribe can consume and then remove the actual captured WAV.
 - Accept secure private directories on filesystems such as btrfs that report a link count of one, and perform captured-child cleanup before closing pipe objects so QML model writes complete normally.

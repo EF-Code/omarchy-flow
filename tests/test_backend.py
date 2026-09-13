@@ -559,31 +559,20 @@ class TestFlowBackend(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 backend._transcribe_local("recording.wav")
 
-    def test_dedicated_cloud_transcription_uses_file_upload(self):
+    def test_dedicated_cloud_transcription_uses_inline_audio(self):
         interaction = SimpleNamespace(output_text="  Cloud result  ")
-        uploaded = {}
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             with patch.object(
                 backend, "get_gemini_api_key", return_value="api-key-123456789"
             ), patch("google.genai.Client") as client_type:
                 client = client_type.return_value
-                def upload(file, config):
-                    uploaded["bytes"] = file.read()
-                    return SimpleNamespace(
-                        name="uploaded-audio", uri="https://example.invalid/audio",
-                        mime_type="audio/wav",
-                    )
-                client.files.upload.side_effect = upload
                 client.interactions.create.return_value = interaction
                 result = backend._cloud_transcription_operation(
                     b"RIFF test", "gemini-3.5-transcribe", "api-key-123456789"
                 )
 
         self.assertEqual(result, "Cloud result")
-        upload_call = client.files.upload.call_args
-        self.assertEqual(uploaded["bytes"], b"RIFF test")
-        self.assertEqual(upload_call.kwargs["config"].mime_type, "audio/wav")
         self.assertEqual(
             client_type.call_args.kwargs["http_options"].timeout,
             backend.NETWORK_TIMEOUT_MS,
@@ -592,17 +581,36 @@ class TestFlowBackend(unittest.TestCase):
             client_type.call_args.kwargs["http_options"].retry_options.attempts,
             1,
         )
-        client.files.delete.assert_called_once_with(name="uploaded-audio")
+        client.files.upload.assert_not_called()
+        client.files.delete.assert_not_called()
         call = client.interactions.create.call_args
         self.assertEqual(call.kwargs["model"], "gemini-3.5-transcribe")
         self.assertEqual(
             call.kwargs["input"],
-            [{"type": "audio", "uri": "https://example.invalid/audio", "mime_type": "audio/wav"}],
+            [{"type": "audio", "data": "UklGRiB0ZXN0", "mime_type": "audio/wav"}],
         )
+        self.assertFalse(call.kwargs["store"])
         self.assertEqual(
             call.kwargs["generation_config"]["transcription_config"]["mode"],
             "smart",
         )
+
+    def test_flash_cloud_transcription_uses_low_thinking(self):
+        response = SimpleNamespace(text="Flash result")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            with patch("google.genai.Client") as client_type:
+                client = client_type.return_value
+                client.models.generate_content.return_value = response
+                result = backend._cloud_transcription_operation(
+                    b"RIFF test", "gemini-3.8-flash", "api-key-123456789"
+                )
+
+        self.assertEqual(result, "Flash result")
+        call = client.models.generate_content.call_args
+        self.assertEqual(call.kwargs["model"], "gemini-3.8-flash")
+        self.assertEqual(call.kwargs["config"].thinking_config.thinking_level.value, "LOW")
+        self.assertTrue(call.kwargs["config"].automatic_function_calling.disable)
 
     def test_model_dispatch_rejects_unknown_model(self):
         with self.assertRaises(ValueError):
@@ -628,6 +636,36 @@ class TestFlowBackend(unittest.TestCase):
                 ]
                 with self.assertRaises(backend.CapturedOutputLimitError):
                     backend._run_captured(command, timeout=2, max_output_bytes=1024)
+
+    def test_subprocess_boundary_excludes_credentials_and_ignores_path(self):
+        hostile_dir = Path(self.temp_dir.name) / "hostile-bin"
+        hostile_dir.mkdir()
+        fake_helper = hostile_dir / "flow-untrusted-helper"
+        fake_helper.write_text("#!/bin/sh\nexit 0\n")
+        fake_helper.chmod(0o755)
+        source = {
+            "PATH": str(hostile_dir),
+            "GEMINI_API_KEY": "must-not-leak",
+            "AWS_SECRET_ACCESS_KEY": "must-not-leak-either",
+            "WAYLAND_DISPLAY": "wayland-test",
+            "LD_PRELOAD": "/tmp/evil.so",
+        }
+        child_env = backend._safe_subprocess_env(source)
+        self.assertEqual(child_env["WAYLAND_DISPLAY"], "wayland-test")
+        self.assertEqual(child_env["PATH"], "/usr/bin")
+        self.assertNotIn("GEMINI_API_KEY", child_env)
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", child_env)
+        self.assertNotIn("LD_PRELOAD", child_env)
+        with patch.dict(os.environ, source, clear=True):
+            with self.assertRaises(FileNotFoundError):
+                backend._run_captured(["flow-untrusted-helper"], timeout=1)
+            with self.assertRaises(FileNotFoundError):
+                backend._run_captured([str(fake_helper)], timeout=1)
+            result = backend._run_captured(["/usr/bin/env"], timeout=1, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn("must-not-leak", result.stdout)
+        self.assertNotIn("GEMINI_API_KEY", result.stdout)
+        self.assertIn("WAYLAND_DISPLAY=wayland-test", result.stdout)
 
     def test_captured_timeout_kills_descendants_after_leader_exits(self):
         pid_file = Path(self.temp_dir.name) / "descendant.pid"
@@ -861,23 +899,27 @@ class TestFlowBackend(unittest.TestCase):
             calls.append((args, kwargs))
             return subprocess.CompletedProcess(args=args, returncode=0)
 
-        with patch("subprocess.run", side_effect=fake_run), patch.object(backend.time, "sleep"):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "must-not-leak"}), patch(
+            "subprocess.run", side_effect=fake_run
+        ), patch.object(backend.time, "sleep"):
             self.assertTrue(backend._inject_text("hello", auto_submit=True))
 
         self.assertEqual(
             [call[0] for call in calls],
             [
-                ["wl-copy", "--sensitive"],
-                ["wtype", "-"],
-                ["wtype", "-k", "Return"],
+                ["/usr/bin/wl-copy", "--sensitive"],
+                ["/usr/bin/wtype", "-"],
+                ["/usr/bin/wtype", "-k", "Return"],
             ],
         )
         self.assertEqual(calls[0][1]["input"], "hello")
         self.assertEqual(calls[1][1]["input"], "hello")
         self.assertNotIn("hello", calls[1][0])
+        for _args, kwargs in calls:
+            self.assertNotIn("GEMINI_API_KEY", kwargs["env"])
 
         def wtype_failure(args, **kwargs):
-            code = 1 if args[0] == "wtype" else 0
+            code = 1 if args[0] == "/usr/bin/wtype" else 0
             return subprocess.CompletedProcess(args=args, returncode=code)
 
         with patch("subprocess.run", side_effect=wtype_failure):
@@ -897,6 +939,7 @@ class TestFlowBackend(unittest.TestCase):
 
         self.assertEqual(popen.call_count, 1)
         command = popen.call_args.args[0]
+        self.assertEqual(command[0], "/usr/bin/ffmpeg")
         self.assertEqual(
             command[command.index("-f") : command.index("-f") + 4],
             ["-f", "pulse", "-i", "default"],
@@ -909,6 +952,7 @@ class TestFlowBackend(unittest.TestCase):
         self.assertTrue(command[-1].startswith("/proc/self/fd/"))
         self.assertEqual(tuple(popen.call_args.kwargs["pass_fds"]), (int(command[-1].rsplit("/", 1)[1]),))
         self.assertEqual(popen.call_args.kwargs["umask"], 0o077)
+        self.assertNotIn("GEMINI_API_KEY", popen.call_args.kwargs["env"])
         self.assertEqual(file_mode(backend.PID_FILE), 0o600)
         data = json.loads(Path(backend.STATE_FILE).read_text())
         self.assertEqual(data["pid"], 4242)

@@ -23,7 +23,7 @@ import warnings
 import shutil
 import importlib.util
 import selectors
-import io
+import base64
 import multiprocessing
 
 # Dynamically discover and include virtual environment site-packages (e.g. ~/.venv)
@@ -149,6 +149,33 @@ CAPTURE_DIR_PREFIX = ".cap-"
 WATCHDOG_GRACE_TERM_SECONDS = 0.5
 WATCHDOG_GRACE_KILL_SECONDS = 0.5
 
+# External desktop helpers are system packages on Omarchy. Never resolve them
+# through the caller's PATH, which may point at a substituted executable.
+TRUSTED_EXECUTABLE_DIRS = ("/usr/bin",)
+SAFE_SUBPROCESS_ENV_KEYS = (
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DISPLAY",
+    "HOME",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PIPEWIRE_REMOTE",
+    "PULSE_SERVER",
+    "TZ",
+    "USER",
+    "WAYLAND_DISPLAY",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_DATA_DIRS",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_DESKTOP",
+    "XDG_STATE_HOME",
+)
+
 DEFAULT_SETTINGS = {
     "toggle_action": "transcribe",
     "audio_source": "default",
@@ -197,6 +224,61 @@ for directory in [XDG_RUNTIME_DIR, CONFIG_DIR, RUNTIME_DIR, STATE_DIR]:
 
 class CapturedOutputLimitError(subprocess.SubprocessError):
     """Raised after stopping a child that exceeds a captured-output ceiling."""
+
+
+def _safe_subprocess_env(source=None):
+    """Build a minimal desktop environment without credentials or loader hooks."""
+    source = os.environ if source is None else source
+    child_env = {
+        key: source[key]
+        for key in SAFE_SUBPROCESS_ENV_KEYS
+        if key in source and isinstance(source[key], str)
+    }
+    child_env["PATH"] = os.pathsep.join(TRUSTED_EXECUTABLE_DIRS)
+    return child_env
+
+
+def _trusted_executable(command):
+    """Resolve a helper from fixed system directories and validate its inode."""
+    if not isinstance(command, str) or not command or "\x00" in command:
+        raise FileNotFoundError("invalid executable")
+    if os.path.isabs(command):
+        command_path = os.path.abspath(command)
+        trusted_location = any(
+            command_path.startswith(os.path.abspath(directory) + os.sep)
+            for directory in TRUSTED_EXECUTABLE_DIRS
+        )
+        approved_application_paths = {
+            os.path.realpath(sys.executable),
+            os.path.realpath(os.path.join(os.path.dirname(__file__), "flowctl")),
+        }
+        if not trusted_location and os.path.realpath(command_path) not in approved_application_paths:
+            raise FileNotFoundError("absolute executable is outside approved locations")
+        candidates = [command]
+    elif os.sep in command:
+        raise FileNotFoundError("relative executable paths are not allowed")
+    else:
+        candidates = [os.path.join(directory, command) for directory in TRUSTED_EXECUTABLE_DIRS]
+
+    for candidate in candidates:
+        resolved = os.path.realpath(candidate)
+        try:
+            info = os.stat(resolved)
+            parent_info = os.stat(os.path.dirname(resolved))
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
+            continue
+        if info.st_uid not in {0, os.getuid()} or info.st_mode & 0o022:
+            continue
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid not in {0, os.getuid()}
+            or parent_info.st_mode & 0o022
+        ):
+            continue
+        return resolved
+    raise FileNotFoundError(f"trusted executable not found: {command}")
 
 
 def _kill_process_group(pgid, sig):
@@ -355,13 +437,9 @@ def _stop_captured_process_group(process, pgid, streams=(), descendant_pidfds=No
 def _run_captured(args, *, timeout, text=False, env=None,
                   max_output_bytes=MAX_CAPTURED_OUTPUT_BYTES, pass_fds=()):
     """Run a child in its own session with group-wide TERM->KILL and output caps."""
-    # Scrub dangerous env vars even when caller passes None (inherit)
-    if env is None:
-        env = os.environ.copy()
-    else:
-        env = dict(env)
-    for _bad in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "LD_DEBUG", "PYTHONPATH", "PYTHONHOME"):
-        env.pop(_bad, None)
+    args = list(args)
+    args[0] = _trusted_executable(args[0])
+    env = _safe_subprocess_env(os.environ if env is None else env)
     process = subprocess.Popen(
         args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, env=env,
@@ -1100,7 +1178,9 @@ def migrate_hotkeys():
 
 
 def run_audio_test():
-    if not shutil.which("ffmpeg"):
+    try:
+        _trusted_executable("ffmpeg")
+    except OSError:
         return {"ok": False, "message": "ffmpeg is not installed"}
     target = None
     capture_dir = None
@@ -1152,7 +1232,10 @@ def diagnostics():
     checks = []
 
     def add_tool(tool, label, required):
-        path = shutil.which(tool)
+        try:
+            path = _trusted_executable(tool)
+        except OSError:
+            path = None
         checks.append({
             "id": tool,
             "label": label,
@@ -1168,7 +1251,11 @@ def diagnostics():
         add_tool("voxtype", "Local Whisper", True)
         model_ready = False
         model_detail = f"Run voxtype setup model and install {LOCAL_VOXTYPE_MODEL}"
-        if shutil.which("voxtype"):
+        try:
+            voxtype_ready = bool(_trusted_executable("voxtype"))
+        except OSError:
+            voxtype_ready = False
+        if voxtype_ready:
             try:
                 result = _run_captured(
                     ["voxtype", "setup", "model", "--list"],
@@ -1473,9 +1560,7 @@ def get_gemini_api_key(deadline=None):
 
 def pill_ipc(action, *args):
     """Send one HUD IPC call, preferring the canonical namespaced target."""
-    clean_env = os.environ.copy()
-    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "LD_DEBUG", "PYTHONPATH", "PYTHONHOME"):
-        clean_env.pop(key, None)
+    clean_env = _safe_subprocess_env()
 
     targets = ["io.github.ef-code.omarchy-flow.pill", "geminipill"]
     config_paths = [
@@ -1983,12 +2068,10 @@ def _start_recording():
         return False
 
     try:
-        _clean_env = os.environ.copy()
-        for _bad in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "LD_DEBUG", "PYTHONPATH", "PYTHONHOME"):
-            _clean_env.pop(_bad, None)
+        _clean_env = _safe_subprocess_env()
         proc = subprocess.Popen(
             [
-                "ffmpeg", "-loglevel", "error",
+                _trusted_executable("ffmpeg"), "-loglevel", "error",
                 "-f", "pulse", "-i", get_settings()["audio_source"],
                 "-t", str(MAX_RECORDING_SECONDS),
                 "-fs", str(MAX_AUDIO_BYTES),
@@ -2353,37 +2436,30 @@ def _cloud_transcription_operation(
         ),
     )
     if model_choice == "gemini-3.5-transcribe":
-        audio_file = client.files.upload(
-            file=io.BytesIO(audio_bytes),
-            config=types.UploadFileConfig(mime_type="audio/wav"),
+        # Recordings are capped well below the Interactions API inline limit.
+        # One request avoids File API upload, processing, and delete round trips
+        # for ephemeral dictation audio.
+        interaction = client.interactions.create(
+            model=model_choice,
+            input=[{
+                "type": "audio",
+                "data": base64.b64encode(audio_bytes).decode("ascii"),
+                "mime_type": "audio/wav",
+            }],
+            generation_config={"transcription_config": {"mode": "smart"}},
+            store=False,
         )
-        try:
-            if on_upload is not None:
-                on_upload(getattr(audio_file, "name", ""))
-            interaction = client.interactions.create(
-                model=model_choice,
-                input=[{
-                    "type": "audio", "uri": audio_file.uri,
-                    "mime_type": "audio/wav",
-                }],
-                generation_config={"transcription_config": {"mode": "smart"}},
-            )
-            return _bounded_transcript(getattr(interaction, "output_text", ""))
-        finally:
-            uploaded_name = getattr(audio_file, "name", "")
-            if uploaded_name:
-                try:
-                    client.files.delete(name=uploaded_name)
-                except Exception as error:
-                    log(f"Could not delete uploaded audio: {type(error).__name__}")
-                    if on_cleanup_needed is not None:
-                        on_cleanup_needed(uploaded_name)
+        return _bounded_transcript(getattr(interaction, "output_text", ""))
     response = client.models.generate_content(
         model=model_choice,
         contents=[
             types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
             "Transcribe this speech accurately. Clean up disfluencies, remove filler words like ums/ahs, format punctuation and capitalization properly. Return ONLY the transcribed text without quotes or explanations.",
         ],
+        config=types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        ),
     )
     return _bounded_transcript(response.text)
 
@@ -2554,16 +2630,18 @@ def _inject_text(text, auto_submit=False):
         text = b.decode("utf-8", errors="ignore")
     if not text:
         return False
-    # Scrub env for clipboard/typing helpers
-    _clean_env = os.environ.copy()
-    for _bad in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "LD_DEBUG", "PYTHONPATH", "PYTHONHOME"):
-        _clean_env.pop(_bad, None)
+    _clean_env = _safe_subprocess_env()
+    try:
+        wtype = _trusted_executable("wtype")
+    except OSError:
+        return False
     clipboard_ok = False
     copy_to_clipboard = get_settings()["copy_to_clipboard"]
     if copy_to_clipboard:
         try:
+            wl_copy = _trusted_executable("wl-copy")
             result = subprocess.run(
-                ["wl-copy", "--sensitive"], input=text, text=True, check=False, timeout=5,
+                [wl_copy, "--sensitive"], input=text, text=True, check=False, timeout=5,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_clean_env
             )
             clipboard_ok = result.returncode == 0
@@ -2575,7 +2653,7 @@ def _inject_text(text, auto_submit=False):
 
     try:
         typed = subprocess.run(
-            ["wtype", "-"], input=text, text=True, check=False, timeout=5,
+            [wtype, "-"], input=text, text=True, check=False, timeout=5,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_clean_env
         )
         if typed.returncode != 0:
@@ -2586,7 +2664,7 @@ def _inject_text(text, auto_submit=False):
     if auto_submit:
         time.sleep(0.08)
         try:
-            submitted = subprocess.run(["wtype", "-k", "Return"], check=False, timeout=5,
+            submitted = subprocess.run([wtype, "-k", "Return"], check=False, timeout=5,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_clean_env)
             if submitted.returncode != 0:
                 return False

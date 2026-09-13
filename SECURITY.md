@@ -45,7 +45,9 @@ If you discover a security vulnerability within Omarchy Flow, please do not open
   `Component.onDestruction` cleanup, and bounded `JSON.parse` (`8-16 KiB`) with
   cardinality caps (`32` items) and `Text.PlainText` rendering for externally
   derived strings.
-- Prefer the environment or GNOME Keyring for Gemini credentials. File-based
+- External helpers receive a strict desktop-variable allowlist that excludes
+  cloud credentials and loader hooks, and system helpers are resolved from a
+  trusted absolute executable directory instead of the caller's `PATH`.
+  Prefer the environment or GNOME Keyring for Gemini credentials. File-based
   credentials are accepted only when owned by the current user and not
-  readable by group or other users, and `pill_ipc` scrubs `LD_*`/`PYTHON*`
-  from the child environment.
+  readable by group or other users.
