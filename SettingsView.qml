@@ -37,11 +37,7 @@ Item {
   readonly property color mutedForeground: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.68)
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
 
-  readonly property var modelOptions: [
-    { value: "whisper-base.en", label: "Local Whisper (base.en)" },
-    { value: "gemini-3.5-transcribe", label: "Gemini 3.5 Transcribe" },
-    { value: "gemini-3.8-flash", label: "Gemini 3.8 Flash" }
-  ]
+  required property var modelOptions
 
   readonly property var hotkeyDefinitions: [
     { id: "toggle", title: "Toggle dictation", description: "Press once to start, again to transcribe" },

@@ -42,13 +42,30 @@ echo "Manifest OK."
 echo ""
 echo "=== 2. Linting QML Components (qmllint) ==="
 OMARCHY_SHELL_PATH="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
-qmllint -I "$OMARCHY_SHELL_PATH" BarWidget.qml SettingsView.qml FlowDropdown.qml Pill.qml Service.qml
+qmllint -I "$OMARCHY_SHELL_PATH" BarWidget.qml SettingsView.qml FlowDropdown.qml FlowModelCatalog.qml Pill.qml Service.qml
 echo "QML Lint OK."
 
 echo ""
 echo "=== 3. Running Backend Unit Tests ==="
 "$PYTHON_BIN" tests/test_backend.py
 echo "Unit tests OK."
+
+echo ""
+echo "=== Model Catalog QML Runtime Checks ==="
+mkdir -m 700 "$TEST_XDG_ROOT/qml" "$TEST_XDG_ROOT/qml/scripts"
+cp FlowModelCatalog.qml "$TEST_XDG_ROOT/qml/FlowModelCatalog.qml"
+cp FlowPaths.js "$TEST_XDG_ROOT/qml/FlowPaths.js"
+cp scripts/flowctl scripts/gemini-dictate.py "$TEST_XDG_ROOT/qml/scripts/"
+cp tests/test_models.qml "$TEST_XDG_ROOT/qml/shell.qml"
+QML_MODEL_OUTPUT="$(QT_QPA_PLATFORM=offscreen timeout 12 quickshell -p "$TEST_XDG_ROOT/qml/shell.qml" 2>&1)" || {
+  echo "$QML_MODEL_OUTPUT"
+  exit 1
+}
+if [[ "$QML_MODEL_OUTPUT" != *FLOW_MODEL_TEST_PASS* || "$QML_MODEL_OUTPUT" == *FLOW_MODEL_TEST_FAIL* ]]; then
+  echo "$QML_MODEL_OUTPUT"
+  exit 1
+fi
+echo "Model catalog runtime OK."
 
 echo ""
 echo "=== 4. Testing CLI Dispatcher (flowctl) ==="

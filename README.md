@@ -12,7 +12,7 @@ Gemini, and types the result into the focused application.
 
 - A compact dictation pill with recording, pause, submit, and cancel controls
 - Local English transcription with Voxtype and Whisper `base.en`
-- Cloud transcription with two supported Google Gemini models
+- Cloud transcription with dedicated speech and free-tier Gemini Flash options
 - A theme-adaptive bar widget with quick actions and settings
 - Configurable microphone input, transcript handling, HUD position, and global shortcuts
 - Dependency and microphone diagnostics from the settings panel
@@ -49,6 +49,21 @@ shortcuts.
 
 Flow accepts only these model IDs. Other Gemini models, API providers, and
 local model IDs are not currently supported.
+
+The menu, settings, and pill all read this same backend catalog. Existing saved
+selections remain valid, and new installations still default to local Whisper.
+For everyday dictation, start with Gemini 3.5 Transcribe; Gemini 3.8 Flash remains
+available for general speech understanding. Both cloud options
+currently offer a free API tier, subject to project quotas and availability.
+A billing-enabled project can incur charges; model selection does not enforce
+free-tier billing. See Google's [pricing](https://ai.google.dev/gemini-api/docs/pricing)
+and [model catalog](https://ai.google.dev/gemini-api/docs/models).
+
+All cloud modes retain the 20 MiB recording cap and hard 90-second operation
+deadline. Recordings are sent inline; dedicated transcription uses `store=False`.
+If the pill reports **Cloud quota exceeded**, check the project's quota and billing
+or select another model. Flow never switches providers or sends local recordings
+to a cloud model automatically.
 
 ## Local Whisper setup
 
@@ -185,7 +200,7 @@ Run the repository validation suite with:
 bash tests/run.sh
 ```
 
-The suite checks the manifest, QML imports, backend state handling,
+The suite checks the manifest, QML imports and model-catalog runtime behavior, backend state handling,
 transcription dispatch, isolated configuration paths, CLI arguments, Python
 syntax, portability, and shell scripts. It does not make a live Gemini request,
 record microphone audio, or type into an application.

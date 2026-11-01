@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
+import "FlowPaths.js" as FlowPaths
 
 Item {
     id: root
@@ -15,8 +16,16 @@ Item {
     property string hudPosition: "bottom"
     property bool waveformEnabled: true
 
-    readonly property string flowctlPath: decodeURIComponent(String(Qt.resolvedUrl("scripts/flowctl")).replace(/^file:\/\//, ""))
+    readonly property string flowctlPath: FlowPaths.localPath(Qt.resolvedUrl("scripts/flowctl"))
     readonly property int maxTextLength: 256
+
+    FlowModelCatalog {
+        id: modelCatalog
+        flowctlPath: root.flowctlPath
+        onModelsChanged: Qt.callLater(function() {
+            if (!loadModelProcess.running) loadModelProcess.running = true
+        })
+    }
 
     function sanitizedStatusText(raw) {
         if (!raw || typeof raw !== "string") return ""
@@ -29,7 +38,7 @@ Item {
         if (!raw || typeof raw !== "string") return "whisper-base.en"
         var s = raw.trim()
         if (s.length > 64) s = s.slice(0, 64)
-        if (s === "whisper-base.en" || s === "gemini-3.5-transcribe" || s === "gemini-3.8-flash") return s
+        if (modelCatalog.find(s)) return s
         return "whisper-base.en"
     }
 
@@ -314,11 +323,7 @@ Item {
                     width: parent.width - 16
 
                     Repeater {
-                        model: [
-                            { id: "whisper-base.en", title: "Local Whisper", subtitle: "base.en • Offline" },
-                            { id: "gemini-3.5-transcribe", title: "Gemini 3.5 Transcribe", subtitle: "Cloud • Dedicated transcription" },
-                            { id: "gemini-3.8-flash", title: "Gemini 3.8 Flash", subtitle: "Cloud • Speech transcription" }
-                        ]
+                        model: modelCatalog.models
 
                         Rectangle {
                             width: menuCol.width
@@ -346,7 +351,7 @@ Item {
                                         textFormat: Text.PlainText
                                     }
                                     Text {
-                                        text: modelData.subtitle
+                                        text: modelData.desc
                                         font.pixelSize: 9
                                         color: "#CBD5E1"
                                         textFormat: Text.PlainText
@@ -375,8 +380,9 @@ Item {
                                 onClicked: {
                                     // Update this view immediately; the persisted model remains
                                     // authoritative and the loader rolls this back if saving fails.
-                                    root.selectedModel = root.sanitizedModelId(modelData.id)
-                                    saveModelProcess.save(modelData.id)
+                                    if (saveModelProcess.save(modelData.id) === "ok") {
+                                        root.selectedModel = root.sanitizedModelId(modelData.id)
+                                    }
                                     root.dropdownOpen = false
                                 }
                             }
@@ -536,10 +542,8 @@ Item {
                                     if (root.stateMode === "done") return root.statusText || "Done"
                                     if (root.stateMode === "status") return root.statusText || "Status"
                                     if (root.stateMode === "transcribing") return "Transcribing..."
-                                    if (root.selectedModel === "whisper-base.en") return "Whisper"
-                                    if (root.selectedModel === "gemini-3.5-transcribe") return "3.5 Transcribe"
-                                    if (root.selectedModel === "gemini-3.8-flash") return "3.8 Flash"
-                                    return root.selectedModel
+                                    var selected = modelCatalog.find(root.selectedModel)
+                                    return selected ? selected.shortName : root.selectedModel
                                 }
                                 font.pixelSize: 11
                                 font.weight: Font.DemiBold

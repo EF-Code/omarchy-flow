@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Load every model selector and pill label from one bounded backend catalog, including a QML runtime regression test for malformed catalogs.
+
 ### Fixed
+- Resolve both `qs:///` and `file:///` script URLs so newer Quickshell versions can launch Flow controls and synchronize the displayed model.
+- Show fixed, actionable quota, access, model-availability, service, and timeout messages without displaying raw cloud error text.
+- Keep the pill's displayed model unchanged when an overlapping model write is rejected as busy.
 - Reduce cloud transcription latency by sending capped ephemeral audio inline instead of using a three-round-trip File API lifecycle, and use low thinking for speech-only Gemini Flash requests.
 - Prevent Gemini and unrelated environment credentials from reaching external helpers by using a strict child-environment allowlist and trusted absolute system executable paths.
 - Keep the running pill synchronized with authoritative model changes from settings, service IPC, direct CLI use, and its own selector; pin each recording to its start-time privacy mode and replace Gemini 3.7 Flash with stable Gemini 3.8 Flash.

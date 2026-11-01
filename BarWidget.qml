@@ -3,23 +3,26 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "FlowPaths.js" as FlowPaths
 
 BarWidget {
   id: root
   moduleName: "io.github.ef-code.omarchy-flow"
 
-  readonly property string flowctlPath: decodeURIComponent(String(Qt.resolvedUrl("scripts/flowctl")).replace(/^file:\/\//, ""))
+  readonly property string flowctlPath: FlowPaths.localPath(Qt.resolvedUrl("scripts/flowctl"))
   property bool isRecording: false
   property bool isPaused: false
   property string selectedModel: "whisper-base.en"
   property bool menuOpen: false
   property bool settingsOpen: false
 
-  readonly property var modelOptions: [
-    { id: "whisper-base.en", title: "Local Whisper", subtitle: "base.en · Offline" },
-    { id: "gemini-3.5-transcribe", title: "Gemini 3.5 Transcribe", subtitle: "Cloud · Dedicated transcription" },
-    { id: "gemini-3.8-flash", title: "Gemini 3.8 Flash", subtitle: "Cloud · Speech understanding" }
-  ]
+  readonly property var modelOptions: modelCatalog.models
+
+  FlowModelCatalog {
+    id: modelCatalog
+    flowctlPath: root.flowctlPath
+    onModelsChanged: Qt.callLater(root.refreshStatus)
+  }
 
   // Per-instance jitter de-syncs concurrent polls when the bar creates one
   // widget per monitor, avoiding a thundering herd on flowctl status.
@@ -302,7 +305,7 @@ BarWidget {
 
                 Text {
                   width: parent.width
-                  text: modelData.subtitle
+                  text: modelData.desc
                   color: menuPopup.mutedForeground
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
                   font.pixelSize: Style.font.caption
@@ -445,6 +448,7 @@ BarWidget {
       bar: root.bar
       flowctlPath: root.flowctlPath
       selectedModel: root.selectedModel
+      modelOptions: modelCatalog.dropdownOptions
       onCloseRequested: root.returnToMenu()
       onModelRequested: function(modelId) { root.selectModel(modelId, false) }
     }

@@ -121,13 +121,14 @@ LOCAL_MODEL_ID = "whisper-base.en"
 LOCAL_VOXTYPE_MODEL = "base.en"
 
 SUPPORTED_MODELS = [
-    {"id": LOCAL_MODEL_ID, "name": "Local Whisper (base.en)", "desc": "Local • Offline", "provider": "local"},
-    {"id": "gemini-3.5-transcribe", "name": "Gemini 3.5 Transcribe", "desc": "Cloud • Dedicated transcription", "provider": "gemini"},
-    {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash", "desc": "Cloud • Speech transcription", "provider": "gemini"},
+    {"id": LOCAL_MODEL_ID, "name": "Local Whisper (base.en)", "title": "Local Whisper", "shortName": "Whisper", "desc": "base.en · Offline", "provider": "local"},
+    {"id": "gemini-3.5-transcribe", "name": "Gemini 3.5 Transcribe", "title": "Gemini 3.5 Transcribe", "shortName": "3.5 Transcribe", "desc": "Cloud · Dedicated transcription", "provider": "gemini"},
+    {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash", "title": "Gemini 3.8 Flash", "shortName": "3.8 Flash", "desc": "Cloud · Speech understanding", "provider": "gemini", "thinking_level": "low"},
 ]
 
 DEFAULT_MODEL_ID = SUPPORTED_MODELS[0]["id"]
 SUPPORTED_MODEL_IDS = frozenset(model["id"] for model in SUPPORTED_MODELS)
+MODELS_BY_ID = {model["id"]: model for model in SUPPORTED_MODELS}
 
 # Application-owned resource ceilings. Ten minutes of 16 kHz mono PCM is
 # about 19.2 MB, leaving room for the WAV header inside the byte ceiling.
@@ -2393,6 +2394,25 @@ class MissingApiKeyError(RuntimeError):
     """Raised when a cloud model is selected without a configured API key."""
 
 
+class CloudTranscriptionError(RuntimeError):
+    """Expose a fixed actionable status without forwarding service error text."""
+
+    STATUS_MESSAGES = {
+        401: "Cloud access denied",
+        403: "Cloud access denied",
+        404: "Model unavailable",
+        429: "Cloud quota exceeded",
+        500: "Cloud service unavailable",
+        502: "Cloud service unavailable",
+        503: "Cloud service unavailable",
+        504: "Cloud service unavailable",
+    }
+
+    def __init__(self, code=None):
+        self.status = self.STATUS_MESSAGES.get(code, "Transcription Error") if type(code) is int else "Transcription Error"
+        super().__init__(self.status)
+
+
 def _transcribe_local(target_audio):
     result = _run_captured(
         ["voxtype", "--model", LOCAL_VOXTYPE_MODEL, "transcribe", target_audio],
@@ -2426,6 +2446,9 @@ def _cloud_transcription_operation(
     audio_bytes, model_choice, api_key, on_upload=None, on_cleanup_needed=None
 ):
     """Perform all SDK work inside the caller's cancellable process boundary."""
+    model = MODELS_BY_ID.get(model_choice)
+    if model is None or model["provider"] != "gemini":
+        raise ValueError("unsupported cloud model selection")
     from google import genai
     from google.genai import types
     client = genai.Client(
@@ -2457,7 +2480,7 @@ def _cloud_transcription_operation(
             "Transcribe this speech accurately. Clean up disfluencies, remove filler words like ums/ahs, format punctuation and capitalization properly. Return ONLY the transcribed text without quotes or explanations.",
         ],
         config=types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_level="low"),
+            thinking_config=types.ThinkingConfig(thinking_level=model["thinking_level"]),
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         ),
     )
@@ -2485,9 +2508,11 @@ def _cloud_transcription_worker(connection, audio_bytes, model_choice, api_key):
         )
         payload = json.dumps({"ok": True, "text": result}, separators=(",", ":")).encode("utf-8")
     except BaseException as error:
+        code = getattr(error, "code", None)
         payload = json.dumps({
             "ok": False,
             "error": type(error).__name__[:128],
+            "code": code if type(code) is int else None,
         }, separators=(",", ":")).encode("utf-8")
     try:
         connection.send_bytes(payload[:MAX_TRANSCRIPT_BYTES + 1024])
@@ -2602,7 +2627,7 @@ def _transcribe_cloud(target_audio, model_choice):
             worker.join(WATCHDOG_GRACE_KILL_SECONDS)
             raise TimeoutError("transcription worker did not exit")
         if not result.get("ok"):
-            raise RuntimeError(f"cloud transcription failed: {result.get('error', 'unknown')}")
+            raise CloudTranscriptionError(result.get("code"))
         if cleanup_needed:
             _run_cloud_cleanup(context, cleanup_needed, api_key, overall_deadline)
         return _bounded_transcript(result.get("text", ""))
@@ -2752,6 +2777,14 @@ def _stop_recording(auto_submit=False, pids=None):
         except MissingApiKeyError:
             log("Gemini API key not configured")
             pill_ipc("setStatus", "No API Key")
+            return False
+        except CloudTranscriptionError as error:
+            log("Cloud transcription request failed")
+            pill_ipc("setStatus", error.status)
+            return False
+        except TimeoutError:
+            log("Transcription operation timed out")
+            pill_ipc("setStatus", "Transcription timed out")
             return False
         except Exception as error:
             log(f"Transcription failed: {type(error).__name__}")

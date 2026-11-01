@@ -595,22 +595,60 @@ class TestFlowBackend(unittest.TestCase):
             "smart",
         )
 
-    def test_flash_cloud_transcription_uses_low_thinking(self):
+    def test_content_cloud_models_use_supported_thinking_levels(self):
         response = SimpleNamespace(text="Flash result")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
+        for model, level in [
+            ("gemini-3.8-flash", "LOW"),
+        ]:
             with patch("google.genai.Client") as client_type:
                 client = client_type.return_value
                 client.models.generate_content.return_value = response
                 result = backend._cloud_transcription_operation(
-                    b"RIFF test", "gemini-3.8-flash", "api-key-123456789"
+                    b"RIFF test", model, "api-key-123456789"
                 )
 
-        self.assertEqual(result, "Flash result")
-        call = client.models.generate_content.call_args
-        self.assertEqual(call.kwargs["model"], "gemini-3.8-flash")
-        self.assertEqual(call.kwargs["config"].thinking_config.thinking_level.value, "LOW")
-        self.assertTrue(call.kwargs["config"].automatic_function_calling.disable)
+            self.assertEqual(result, "Flash result")
+            call = client.models.generate_content.call_args
+            self.assertEqual(call.kwargs["model"], model)
+            self.assertEqual(call.kwargs["config"].thinking_config.thinking_level.value, level)
+            self.assertTrue(call.kwargs["config"].automatic_function_calling.disable)
+
+    def test_cloud_models_persist_and_dispatch_without_changing_local_default(self):
+        self.assertEqual(backend.get_selected_model(), backend.LOCAL_MODEL_ID)
+        for model in ("gemini-3.5-transcribe", "gemini-3.8-flash"):
+            self.assertTrue(backend.set_selected_model(model))
+            self.assertEqual(backend.get_current_state()["model"], model)
+            with patch.object(backend, "_transcribe_cloud", return_value="hello") as cloud:
+                self.assertEqual(backend._transcribe_audio("audio.wav", model), "hello")
+            cloud.assert_called_once_with("audio.wav", model)
+
+    def test_cloud_errors_reach_the_pill_as_fixed_actionable_messages(self):
+        for code, status in [
+            (429, "Cloud quota exceeded"),
+            (403, "Cloud access denied"),
+            (404, "Model unavailable"),
+            (503, "Cloud service unavailable"),
+            (None, "Transcription Error"),
+        ]:
+            Path(backend.TEMP_AUDIO).write_bytes(b"R" * 1200)
+            with patch.object(backend, "_terminate_recorder", return_value=True), patch.object(
+                backend, "_transcribe_audio", side_effect=backend.CloudTranscriptionError(code)
+            ), patch.object(backend, "pill_ipc") as ipc, patch.object(backend, "_inject_text") as inject:
+                self.assertFalse(backend._stop_recording(pids=[4242]))
+            ipc.assert_any_call("setStatus", status)
+            inject.assert_not_called()
+
+    def test_cloud_worker_does_not_forward_service_error_text(self):
+        class ServiceError(Exception):
+            code = 429
+
+        with patch.object(backend, "_cloud_transcription_operation", side_effect=ServiceError("sensitive-service-error")):
+            connection = SimpleNamespace(send_bytes=lambda data: messages.append(data), close=lambda: None)
+            messages = []
+            backend._cloud_transcription_worker(connection, b"audio", "gemini-3.8-flash", "key")
+        payload = json.loads(messages[0])
+        self.assertEqual(payload["code"], 429)
+        self.assertNotIn("sensitive-service-error", messages[0].decode())
 
     def test_model_dispatch_rejects_unknown_model(self):
         with self.assertRaises(ValueError):
@@ -1034,9 +1072,14 @@ class TestFlowBackend(unittest.TestCase):
         self.assertIn('command: [root.flowctlPath, "qml", "remove-hotkeys"]', settings)
         for source in [bar, pill, service, settings]:
             self.assertIn('root.flowctlPath, "qml"', source)
-        for source in [bar, pill, settings, (REPO_ROOT / "scripts" / "gemini-dictate.py").read_text()]:
-            self.assertIn("gemini-3.8-flash", source)
+        for source in [bar, pill, service]:
+            self.assertIn('FlowPaths.localPath(Qt.resolvedUrl("scripts/flowctl"))', source)
+        for source in [bar, pill, settings]:
+            # Selectors read the catalog rather than maintaining separate IDs.
+            self.assertNotIn("gemini-3.8-flash", source)
             self.assertNotIn("gemini-3.7-flash", source)
+        self.assertIn("model: modelCatalog.models", pill)
+        self.assertIn("modelOptions: modelCatalog.dropdownOptions", bar)
 
     def test_qml_flowctl_caps_producer_output(self):
         noisy = [

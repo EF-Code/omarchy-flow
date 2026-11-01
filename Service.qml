@@ -1,11 +1,12 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import "FlowPaths.js" as FlowPaths
 
 Item {
   id: root
 
-  readonly property string flowctlPath: decodeURIComponent(String(Qt.resolvedUrl("scripts/flowctl")).replace(/^file:\/\//, ""))
+  readonly property string flowctlPath: FlowPaths.localPath(Qt.resolvedUrl("scripts/flowctl"))
   property var actionQueue: []
 
   function runNextAction() {
