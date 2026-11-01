@@ -1,12 +1,13 @@
 import QtQuick
 import Quickshell.Io
 
-// Every selector consumes the backend's allowlisted catalog. Keep one safe
-// offline option available if the bounded startup query cannot complete.
+// Catalog availability describes choices, never the persisted model selection.
+// The fallback permits an explicit local selection after a failed query.
 Item {
   id: root
   required property string flowctlPath
   property bool ready: false
+  property int attempts: 1
   property var models: [
     { id: "whisper-base.en", name: "Local Whisper (base.en)", title: "Local Whisper", shortName: "Whisper", desc: "base.en · Offline", provider: "local" }
   ]
@@ -60,5 +61,11 @@ Item {
     interval: 5000
     running: catalogProcess.running
     onTriggered: catalogProcess.running = false
+  }
+
+  Timer {
+    interval: 3000
+    running: !root.ready && !catalogProcess.running && root.attempts < 3
+    onTriggered: { root.attempts++; catalogProcess.running = true }
   }
 }

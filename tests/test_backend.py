@@ -385,7 +385,8 @@ class TestFlowBackend(unittest.TestCase):
 
     def test_get_current_state(self):
         state = backend.get_current_state()
-        self.assertEqual(set(state), {"recording", "paused", "model"})
+        self.assertEqual(set(state), {"recording", "paused", "model", "recording_model"})
+        self.assertEqual(state["recording_model"], "")
         self.assertFalse(state["recording"])
         self.assertFalse(state["paused"])
 
@@ -405,6 +406,16 @@ class TestFlowBackend(unittest.TestCase):
             backend.update_runtime_state("paused", paused=True, pid=12345)
         data = json.loads(Path(backend.STATE_FILE).read_text())
         self.assertEqual(data["model"], "gemini-3.5-transcribe")
+
+    def test_status_reports_active_cloud_model_separately_from_next_local_choice(self):
+        backend.update_runtime_state(
+            "recording", paused=False, pid=4242, model="gemini-3.5-transcribe"
+        )
+        self.assertTrue(backend.set_selected_model("whisper-base.en"))
+        with patch.object(backend, "is_recording", return_value=True):
+            state = backend.get_current_state()
+        self.assertEqual(state["model"], "whisper-base.en")
+        self.assertEqual(state["recording_model"], "gemini-3.5-transcribe")
 
     def test_legacy_pid_marker_failure_does_not_block_recording_state(self):
         original_write = backend._write_private_text
@@ -996,6 +1007,40 @@ class TestFlowBackend(unittest.TestCase):
         self.assertEqual(data["pid"], 4242)
         self.assertEqual(data["start_ticks"], 1234)
 
+    def test_stale_ui_model_cannot_start_cloud_capture(self):
+        self.assertTrue(backend.set_selected_model("gemini-3.5-transcribe"))
+        with patch.object(backend, "_create_exclusive_capture_target") as capture, patch.object(
+            backend, "pill_ipc"
+        ) as ipc:
+            for action in (backend.start_recording, backend.toggle_recording):
+                for expected in ("whisper-base.en", "unconfirmed"):
+                    self.assertFalse(action(expected_model=expected))
+            self.assertFalse(backend.start_recording(expected_model="unknown"))
+        capture.assert_not_called()
+        ipc.assert_any_call("setStatus", "Model changed; try again")
+        self.assertFalse(Path(backend.STATE_FILE).exists())
+
+    def test_start_pins_checked_model_despite_concurrent_setting_change(self):
+        process = SimpleNamespace(pid=4242, returncode=None, poll=lambda: None)
+
+        def spawn(*_args, **_kwargs):
+            self.assertTrue(backend.set_selected_model("gemini-3.5-transcribe"))
+            return process
+
+        with patch.object(backend, "pill_ipc"), patch.object(
+            backend, "_process_start_ticks", return_value=1234
+        ), patch.object(backend.time, "sleep"), patch("subprocess.Popen", side_effect=spawn):
+            self.assertTrue(backend.start_recording(expected_model="whisper-base.en"))
+        self.assertEqual(backend._load_runtime_state()["model"], "whisper-base.en")
+        self.assertEqual(backend.get_selected_model(), "gemini-3.5-transcribe")
+
+    def test_toggle_with_stale_expected_model_still_stops_active_recording(self):
+        with patch.object(backend, "_active_recording_pids", return_value=[4242]), patch.object(
+            backend, "_stop_recording", return_value=True
+        ) as stop:
+            self.assertTrue(backend.toggle_recording(expected_model="unconfirmed"))
+        stop.assert_called_once_with(auto_submit=False, pids=[4242])
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg required")
     def test_held_recording_fd_produces_decodable_wav(self):
         target, _capture_dir, capture_fd = backend._create_exclusive_capture_target()
@@ -1061,8 +1106,15 @@ class TestFlowBackend(unittest.TestCase):
         self.assertIn('return geminiHandler.refreshModel()', pill)
         self.assertNotIn('function setModel(modelId: string)', pill)
         self.assertIn('pill_ipc("refreshModel")', (REPO_ROOT / "scripts" / "gemini-dictate.py").read_text())
-        self.assertIn('root.selectedModel = root.sanitizedModelId(modelData.id)', pill)
-        self.assertIn('if (!loadModelProcess.running && !saveModelProcess.running)', pill)
+        self.assertIn('modelState.selectModel(modelData.id)', pill)
+        self.assertIn('toggleProcess.command = modelState.recordingCommand("toggle")', pill)
+        self.assertIn('cmd = modelState.recordingCommand(action)', bar)
+        self.assertNotIn('sanitizedModelId', pill)
+        for source in (bar, pill):
+            self.assertIn('FlowModelState {', source)
+            self.assertIn('modelState.ready ? modelState.selectedModel : ""', source)
+        self.assertNotIn('if (root.selectedModel === modelId)', bar)
+        self.assertNotIn('root.value = v', (REPO_ROOT / "FlowDropdown.qml").read_text())
         self.assertIn('if (menuOpen) root.refreshStatus()', bar)
         self.assertIn("property var actionQueue", service)
         self.assertIn('return "queued"', service)

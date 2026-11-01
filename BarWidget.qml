@@ -10,9 +10,12 @@ BarWidget {
   moduleName: "io.github.ef-code.omarchy-flow"
 
   readonly property string flowctlPath: FlowPaths.localPath(Qt.resolvedUrl("scripts/flowctl"))
-  property bool isRecording: false
-  property bool isPaused: false
-  property string selectedModel: "whisper-base.en"
+  readonly property bool isRecording: modelState.isRecording
+  readonly property bool isPaused: modelState.isPaused
+  readonly property string selectedModel: modelState.ready ? modelState.selectedModel : ""
+  readonly property bool modelBusy: modelState.saving
+  readonly property bool canRecord: modelState.ready && !modelBusy
+  readonly property string displayedModel: modelState.displayedModel || "Model unavailable"
   property bool menuOpen: false
   property bool settingsOpen: false
 
@@ -21,12 +24,12 @@ BarWidget {
   FlowModelCatalog {
     id: modelCatalog
     flowctlPath: root.flowctlPath
-    onModelsChanged: Qt.callLater(root.refreshStatus)
   }
 
-  // Per-instance jitter de-syncs concurrent polls when the bar creates one
-  // widget per monitor, avoiding a thundering herd on flowctl status.
-  readonly property int pollJitter: Math.floor(Math.random() * 700)
+  FlowModelState {
+    id: modelState
+    flowctlPath: root.flowctlPath
+  }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -34,7 +37,10 @@ BarWidget {
   function runAction(action, extraArg) {
     if (actionProcess.running) return false
     var cmd = [root.flowctlPath, "qml", action]
-    if (extraArg !== undefined && extraArg !== null && String(extraArg).trim() !== "") {
+    if (action === "toggle" || action === "toggle-submit" || action === "start") {
+      cmd = modelState.recordingCommand(action)
+      if (cmd.length === 0) return false
+    } else if (extraArg !== undefined && extraArg !== null && String(extraArg).trim() !== "") {
       cmd.push(String(extraArg))
     }
     actionProcess.command = cmd
@@ -42,11 +48,7 @@ BarWidget {
     return true
   }
 
-  function refreshStatus() {
-    if (!statusProcess.running) {
-      statusProcess.running = true
-    }
-  }
+  function refreshStatus() { modelState.refresh() }
 
   function close() {
     root.menuOpen = false
@@ -72,12 +74,7 @@ BarWidget {
 
   function selectModel(modelId, closeMenus) {
     if (closeMenus === undefined) closeMenus = true
-    if (root.selectedModel === modelId) {
-      if (closeMenus) root.close()
-      return
-    }
-    if (!root.runAction("set-model", modelId)) return
-    root.selectedModel = modelId
+    if (actionProcess.running || !modelState.selectModel(modelId)) return
     if (closeMenus) root.close()
   }
 
@@ -89,7 +86,6 @@ BarWidget {
 
   function toggleRecording(): bool {
     if (!root.runAction("toggle")) return false
-    root.isRecording = !root.isRecording
     return true
   }
 
@@ -111,53 +107,6 @@ BarWidget {
     onTriggered: actionProcess.running = false
   }
 
-  Process {
-    id: statusProcess
-    command: [root.flowctlPath, "qml", "status"]
-    stdout: StdioCollector {
-      id: statusOut
-      waitForEnd: true
-    }
-    onExited: function(exitCode) {
-      if (exitCode === 0 && statusOut.text) {
-        try {
-          var raw = statusOut.text
-          if (raw.length > 8192) raw = raw.slice(0, 8192)
-          var data = JSON.parse(raw.trim())
-          if (typeof data !== "object" || data === null) return
-          root.isRecording = data.recording === true
-          root.isPaused = data.paused === true
-          if (data.model && typeof data.model === "string" && data.model.length < 256) {
-            // Only accept known model ids
-            for (var i = 0; i < root.modelOptions.length; i++) {
-              if (root.modelOptions[i].id === data.model) {
-                root.selectedModel = data.model
-                break
-              }
-            }
-          }
-        } catch (e) {}
-      }
-    }
-    Component.onDestruction: if (running) running = false
-  }
-
-  Timer {
-    interval: 5000
-    running: statusProcess.running
-    onTriggered: statusProcess.running = false
-  }
-
-  Timer {
-    interval: (root.isRecording ? 500 : 750) + root.pollJitter
-    repeat: true
-    running: true
-    onTriggered: {
-      if (actionProcess.running) return
-      root.refreshStatus()
-    }
-  }
-
   BarIconButton {
     id: button
     anchors.fill: parent
@@ -169,8 +118,8 @@ BarWidget {
     activeColor: root.isPaused ? "#FBBF24" : Color.accent
 
     tooltipText: root.isRecording
-      ? ("Omarchy Flow: " + (root.isPaused ? "Paused" : "Recording") + " (" + root.selectedModel + ") — Left-Click for Menu")
-      : ("Omarchy Flow: Voice Dictation (" + root.selectedModel + ") — Left-Click for Menu, Right-Click for Quick Action")
+      ? ("Omarchy Flow: " + (root.isPaused ? "Paused" : "Recording") + " (" + root.displayedModel + ") — Left-Click for Menu")
+      : ("Omarchy Flow: Voice Dictation (" + root.displayedModel + ") — Left-Click for Menu, Right-Click for Quick Action")
 
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) {
@@ -234,8 +183,8 @@ BarWidget {
 
           Text {
             text: root.isRecording
-              ? (root.isPaused ? "Recording paused" : "Recording in progress")
-              : "Ready to dictate"
+              ? ((root.isPaused ? "Paused · " : "Recording · ") + root.displayedModel)
+              : (root.canRecord ? "Ready to dictate" : "Model unavailable")
             color: menuPopup.mutedForeground
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.caption
@@ -247,7 +196,7 @@ BarWidget {
       PanelSeparator { foreground: menuPopup.foreground }
 
       Text {
-        text: "Speech model"
+        text: modelState.recordingModel ? "Speech model for next recording" : "Speech model"
         color: menuPopup.foreground
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.caption
@@ -273,7 +222,7 @@ BarWidget {
             height: Style.space(44)
             readonly property bool selected: root.selectedModel === modelData.id
             readonly property bool hovered: modelMouse.containsMouse
-            opacity: actionProcess.running ? 0.55 : 1.0
+            opacity: actionProcess.running || root.modelBusy ? 0.55 : 1.0
             color: selected
               ? Style.selectedFillFor(menuPopup.foreground, Color.accent)
               : hovered ? Style.hoverFillFor(menuPopup.foreground, Color.accent) : "transparent"
@@ -335,7 +284,7 @@ BarWidget {
             MouseArea {
               id: modelMouse
               anchors.fill: parent
-              enabled: !actionProcess.running
+              enabled: !actionProcess.running && !root.modelBusy
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onClicked: root.selectModel(modelData.id)
@@ -365,7 +314,7 @@ BarWidget {
           foreground: menuPopup.foreground
           accent: Color.accent
           bordered: true
-          enabled: !actionProcess.running
+          enabled: !actionProcess.running && !root.modelBusy && root.canRecord
           onClicked: root.closeAfterAction("start")
         }
 
@@ -375,7 +324,7 @@ BarWidget {
           foreground: menuPopup.foreground
           accent: Color.accent
           bordered: true
-          enabled: !actionProcess.running
+          enabled: !actionProcess.running && !root.modelBusy && (root.isRecording || root.canRecord)
           onClicked: root.closeAfterAction("toggle-submit")
         }
 
@@ -427,7 +376,7 @@ BarWidget {
         foreground: menuPopup.foreground
         accent: Color.accent
         bordered: true
-        enabled: !actionProcess.running
+        enabled: !actionProcess.running && !root.modelBusy
         onClicked: root.openSettings()
       }
     }
@@ -448,6 +397,7 @@ BarWidget {
       bar: root.bar
       flowctlPath: root.flowctlPath
       selectedModel: root.selectedModel
+      recordingModel: modelState.ready ? modelState.recordingModel : ""
       modelOptions: modelCatalog.dropdownOptions
       onCloseRequested: root.returnToMenu()
       onModelRequested: function(modelId) { root.selectModel(modelId, false) }

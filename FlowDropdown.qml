@@ -222,7 +222,6 @@ Item {
             if (currentIndex < 0 || currentIndex >= cap) return
             var v = root.optionValue(root.options[currentIndex])
             if (v.length > 256) v = v.slice(0, 256)
-            root.value = v
             root.changed(v)
             popup.close()
           }

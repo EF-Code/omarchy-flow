@@ -41,7 +41,14 @@ if [[ "$ACTION" == "qml" ]]; then
 fi
 
 case "$ACTION" in
-  toggle|toggle-submit|start|stop|done|transcribe|submit|send|pause|toggle-pause|resume|cancel|status|list-models|settings|get-settings|reset-settings|remove-hotkeys|migrate-hotkeys|list-audio-sources|hotkeys-status|doctor|test-audio)
+  toggle|toggle-submit|start)
+    if [[ $# -gt 2 ]]; then
+      echo "Error: '$ACTION' accepts at most one expected model id." >&2
+      exit 1
+    fi
+    exec "$PYTHON_BIN" "$BACKEND_PY" "$@"
+    ;;
+  stop|done|transcribe|submit|send|pause|toggle-pause|resume|cancel|status|list-models|settings|get-settings|reset-settings|remove-hotkeys|migrate-hotkeys|list-audio-sources|hotkeys-status|doctor|test-audio)
     if [[ $# -gt 1 ]]; then
       echo "Error: '$ACTION' does not accept arguments." >&2
       exit 1
@@ -121,6 +128,7 @@ case "$ACTION" in
     echo "  list-audio-sources  List available microphone inputs"
     echo "  doctor           Check Flow dependencies and configuration"
     echo "  test-audio       Capture a short microphone test"
+    echo "  start/toggle/toggle-submit accept an optional expected model id; a mismatch prevents a new recording."
     echo "  reset-settings   Restore Flow preferences to defaults"
     echo "  help             Show this help message"
     ;;

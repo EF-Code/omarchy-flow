@@ -42,7 +42,7 @@ echo "Manifest OK."
 echo ""
 echo "=== 2. Linting QML Components (qmllint) ==="
 OMARCHY_SHELL_PATH="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
-qmllint -I "$OMARCHY_SHELL_PATH" BarWidget.qml SettingsView.qml FlowDropdown.qml FlowModelCatalog.qml Pill.qml Service.qml
+qmllint -I "$OMARCHY_SHELL_PATH" BarWidget.qml SettingsView.qml FlowDropdown.qml FlowModelCatalog.qml FlowModelState.qml Pill.qml Service.qml
 echo "QML Lint OK."
 
 echo ""
@@ -66,6 +66,30 @@ if [[ "$QML_MODEL_OUTPUT" != *FLOW_MODEL_TEST_PASS* || "$QML_MODEL_OUTPUT" == *F
   exit 1
 fi
 echo "Model catalog runtime OK."
+
+echo ""
+echo "=== Model Selection Failure and Synchronization Checks ==="
+cp FlowModelState.qml "$TEST_XDG_ROOT/qml/"
+cp scripts/flowctl "$TEST_XDG_ROOT/qml/scripts/real-flowctl"
+export FLOW_TEST_REAL_FLOWCTL="$TEST_XDG_ROOT/qml/scripts/real-flowctl"
+"$FLOW_TEST_REAL_FLOWCTL" model gemini-3.5-transcribe >/dev/null
+mkdir -m 700 "$TEST_XDG_ROOT/qml/fixtures"
+for mode in fail malformed timeout slow-save write-fails bad-status; do
+  cp tests/model_fixture.sh "$TEST_XDG_ROOT/qml/fixtures/$mode"
+  chmod 700 "$TEST_XDG_ROOT/qml/fixtures/$mode"
+done
+cp tests/model_fixture.sh "$TEST_XDG_ROOT/qml/scripts/flowctl"
+chmod 700 "$TEST_XDG_ROOT/qml/scripts/flowctl"
+cp tests/test_model_state.qml "$TEST_XDG_ROOT/qml/shell.qml"
+QML_STATE_OUTPUT="$(QT_QPA_PLATFORM=offscreen timeout 25 quickshell -p "$TEST_XDG_ROOT/qml/shell.qml" 2>&1)" || {
+  echo "$QML_STATE_OUTPUT"
+  exit 1
+}
+if [[ "$QML_STATE_OUTPUT" != *FLOW_MODEL_STATE_TEST_PASS* || "$QML_STATE_OUTPUT" == *FLOW_MODEL_STATE_TEST_FAIL* ]]; then
+  echo "$QML_STATE_OUTPUT"
+  exit 1
+fi
+echo "Model selection failure and synchronization runtime OK."
 
 echo ""
 echo "=== 4. Testing CLI Dispatcher (flowctl) ==="
@@ -94,7 +118,7 @@ echo "Portability check OK."
 echo ""
 echo "=== 7. Shell Script Quality ==="
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck --severity=info scripts/flowctl tests/run.sh
+  shellcheck --severity=info scripts/flowctl tests/run.sh tests/model_fixture.sh
   echo "ShellCheck OK."
 else
   echo "ShellCheck not installed; skipped."

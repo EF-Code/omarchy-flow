@@ -52,6 +52,10 @@ local model IDs are not currently supported.
 
 The menu, settings, and pill all read this same backend catalog. Existing saved
 selections remain valid, and new installations still default to local Whisper.
+Selections are confirmed from saved backend state even if the model catalog
+cannot load. Unavailable state is shown explicitly and prevents a new recording.
+Model changes during a recording apply to the next recording; the pill continues
+to show the model handling the current audio.
 For everyday dictation, start with Gemini 3.5 Transcribe; Gemini 3.8 Flash remains
 available for general speech understanding. Both cloud options
 currently offer a free API tier, subject to project quotas and availability.

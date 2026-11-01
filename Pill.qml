@@ -11,7 +11,8 @@ Item {
     property string stateMode: "listening" // "listening", "paused", "transcribing", "status", "done"
     property string statusText: ""
     property bool dropdownOpen: false
-    property string selectedModel: "whisper-base.en"
+    readonly property string selectedModel: modelState.ready ? modelState.selectedModel : ""
+    readonly property string displayedModel: modelState.displayedModel
     property bool hudEnabled: true
     property string hudPosition: "bottom"
     property bool waveformEnabled: true
@@ -22,9 +23,11 @@ Item {
     FlowModelCatalog {
         id: modelCatalog
         flowctlPath: root.flowctlPath
-        onModelsChanged: Qt.callLater(function() {
-            if (!loadModelProcess.running) loadModelProcess.running = true
-        })
+    }
+
+    FlowModelState {
+        id: modelState
+        flowctlPath: root.flowctlPath
     }
 
     function sanitizedStatusText(raw) {
@@ -34,72 +37,10 @@ Item {
         return s
     }
 
-    function sanitizedModelId(raw) {
-        if (!raw || typeof raw !== "string") return "whisper-base.en"
-        var s = raw.trim()
-        if (s.length > 64) s = s.slice(0, 64)
-        if (modelCatalog.find(s)) return s
-        return "whisper-base.en"
-    }
-
     function runProcess(process): string {
         if (!process || process.running) return "busy"
         process.running = true
         return "ok"
-    }
-
-    // Load saved model on startup
-    Process {
-        id: loadModelProcess
-        command: [root.flowctlPath, "qml", "model"]
-        running: true
-        stdout: SplitParser {
-            onRead: function(data) {
-                var m = data.trim()
-                if (m.length > 64) m = m.slice(0, 64)
-                if (m) {
-                    root.selectedModel = root.sanitizedModelId(m)
-                }
-            }
-        }
-        Component.onDestruction: if (running) running = false
-    }
-
-    Timer {
-        interval: 3000
-        running: loadModelProcess.running
-        onTriggered: loadModelProcess.running = false
-    }
-
-    Timer {
-        interval: 500
-        repeat: true
-        running: true
-        onTriggered: if (!loadModelProcess.running && !saveModelProcess.running) loadModelProcess.running = true
-    }
-
-    // Save model process
-    Process {
-        id: saveModelProcess
-        command: []
-        function save(modelId: string): string {
-            if (running) return "busy"
-            var safe = root.sanitizedModelId(modelId)
-            command = [root.flowctlPath, "qml", "model", safe]
-            running = true
-            return "ok"
-        }
-        onExited: function(exitCode) {
-            // Commit display state only from the authoritative persisted value.
-            if (!loadModelProcess.running) loadModelProcess.running = true
-        }
-        Component.onDestruction: if (running) running = false
-    }
-
-    Timer {
-        interval: 5000
-        running: saveModelProcess.running
-        onTriggered: saveModelProcess.running = false
     }
 
     Process {
@@ -135,6 +76,7 @@ Item {
         target: "geminipill"
 
         function setListening(): string {
+            modelState.invalidate()
             hideTimer.stop()
             root.statusText = "Listening..."
             root.stateMode = "listening"
@@ -195,7 +137,7 @@ Item {
         }
 
         function refreshModel(): string {
-            if (!loadModelProcess.running) loadModelProcess.running = true
+            modelState.invalidate()
             return "ok"
         }
 
@@ -207,7 +149,7 @@ Item {
         }
 
         function toggle(): string {
-            return root.runProcess(toggleProcess)
+            return root.toggleRecording()
         }
     }
 
@@ -223,7 +165,7 @@ Item {
         function refreshModel(): string { return geminiHandler.refreshModel() }
         function hide(): string { return geminiHandler.hide() }
         function toggle(): string {
-            return root.runProcess(toggleProcess)
+            return root.toggleRecording()
         }
     }
 
@@ -262,9 +204,14 @@ Item {
         Component.onDestruction: if (running) running = false
     }
     Timer { interval: 8000; running: cancelProcess.running; onTriggered: cancelProcess.running = false }
+    function toggleRecording(): string {
+        if (toggleProcess.running) return "busy"
+        toggleProcess.command = modelState.recordingCommand("toggle")
+        return root.runProcess(toggleProcess)
+    }
     Process {
         id: toggleProcess
-        command: [root.flowctlPath, "qml", "toggle"]
+        command: []
         Component.onDestruction: if (running) running = false
     }
     Timer { interval: 130000; running: toggleProcess.running; onTriggered: toggleProcess.running = false }
@@ -322,6 +269,14 @@ Item {
                     spacing: 3
                     width: parent.width - 16
 
+                    Text {
+                        visible: modelState.recordingModel !== ""
+                        text: "Changes apply to next recording"
+                        color: "#CBD5E1"
+                        font.pixelSize: 10
+                        textFormat: Text.PlainText
+                    }
+
                     Repeater {
                         model: modelCatalog.models
 
@@ -374,15 +329,12 @@ Item {
 
                             MouseArea {
                                 id: itemMouse
+                                enabled: !modelState.saving
                                 anchors.fill: parent
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: {
-                                    // Update this view immediately; the persisted model remains
-                                    // authoritative and the loader rolls this back if saving fails.
-                                    if (saveModelProcess.save(modelData.id) === "ok") {
-                                        root.selectedModel = root.sanitizedModelId(modelData.id)
-                                    }
+                                    modelState.selectModel(modelData.id)
                                     root.dropdownOpen = false
                                 }
                             }
@@ -542,8 +494,9 @@ Item {
                                     if (root.stateMode === "done") return root.statusText || "Done"
                                     if (root.stateMode === "status") return root.statusText || "Status"
                                     if (root.stateMode === "transcribing") return "Transcribing..."
-                                    var selected = modelCatalog.find(root.selectedModel)
-                                    return selected ? selected.shortName : root.selectedModel
+                                    var modelId = root.displayedModel
+                                    var selected = modelCatalog.find(modelId)
+                                    return selected ? selected.shortName : (modelId || "Model unavailable")
                                 }
                                 font.pixelSize: 11
                                 font.weight: Font.DemiBold

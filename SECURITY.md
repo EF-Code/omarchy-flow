@@ -34,6 +34,11 @@ If you discover a security vulnerability within Omarchy Flow, please do not open
   recording starts. Changing settings during an active recording affects the
   next recording and cannot silently redirect already captured local-mode
   audio to a cloud model.
+  Model identity is read independently of catalog metadata; unavailable state
+  is never displayed as local/offline. UI model writes require confirmation,
+  and UI recording starts supply the displayed model for a backend comparison
+  before capture. The HUD reports the pinned recording model separately from
+  the next recording's selection.
 - Transcription uses a hard 90 s end-to-end deadline across credential lookup,
   upload, generation, and cleanup in a killable worker (`60 s` per-request
   `NETWORK_TIMEOUT_MS`, retries disabled); failed upload cleanup is retried in a

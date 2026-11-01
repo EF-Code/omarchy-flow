@@ -8,7 +8,8 @@ Item {
 
   property var bar: null
   required property string flowctlPath
-  property string selectedModel: "whisper-base.en"
+  property string selectedModel: ""
+  property string recordingModel: ""
   property string toggleAction: "transcribe"
   property string audioSource: "default"
   property bool copyToClipboard: true
@@ -640,13 +641,24 @@ Item {
       FlowDropdown {
         width: parent.width
         showLabel: false
-        value: root.selectedModel
+        value: root.selectedModel || "Model unavailable"
         options: root.modelOptions
         foreground: root.foreground
         background: Color.popups.background
         popupBorder: Color.popups.border
         accent: Color.accent
         onChanged: root.modelRequested(value)
+      }
+
+      Text {
+        width: parent.width
+        visible: root.recordingModel !== ""
+        text: "Changes apply to the next recording. Current audio uses " + root.recordingModel + "."
+        color: root.mutedForeground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
       }
 
       Text {
@@ -710,7 +722,8 @@ Item {
 
           Text {
             width: parent.width
-            text: root.selectedModel === "whisper-base.en"
+            text: !root.selectedModel ? "Model selection is not confirmed. Choose a model or wait for Flow to reconnect."
+              : root.selectedModel === "whisper-base.en"
               ? "Whisper stays local. Audio is removed after transcription."
               : "Cloud models send the recorded WAV to Google. Audio is removed after transcription."
             color: root.mutedForeground

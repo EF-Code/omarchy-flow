@@ -1916,10 +1916,14 @@ def get_current_state():
     paused = False
     if rec:
         paused = _load_runtime_state().get("paused") is True
+    recording_model = _load_runtime_state().get("model") if rec or _completed_recording_available() else ""
+    if recording_model not in SUPPORTED_MODEL_IDS:
+        recording_model = ""
     return {
         "recording": rec,
         "paused": paused,
         "model": get_selected_model(),
+        "recording_model": recording_model,
     }
 
 def _create_exclusive_capture_target():
@@ -2037,13 +2041,19 @@ def _mirror_legacy_audio():
         pass
 
 
-def _start_recording():
+def _start_recording(expected_model=None):
     if is_recording():
         log("start called, but already recording")
         return False
 
+    model_choice = get_selected_model()
+    if expected_model is not None and (
+        expected_model not in SUPPORTED_MODEL_IDS or expected_model != model_choice
+    ):
+        pill_ipc("setStatus", "Model changed; try again")
+        return False
+
     log("Starting audio recording")
-    pill_ipc("setListening")
     _clear_audio_files()
 
     try:
@@ -2134,7 +2144,7 @@ def _start_recording():
         # would weaken the inode checks used before transcription.
         update_runtime_state(
             "recording", paused=False, pid=proc.pid, audio_path=capture_target,
-            model=get_selected_model(),
+            model=model_choice,
         )
     except OSError as error:
         log(f"Failed to persist recording state: {type(error).__name__}")
@@ -2155,12 +2165,13 @@ def _start_recording():
         return False
 
     log(f"Recording started with PID {proc.pid}")
+    pill_ipc("setListening")
     return True
 
 
-def start_recording():
+def start_recording(expected_model=None):
     with _operation_lock() as locked:
-        return locked and _start_recording()
+        return locked and _start_recording(expected_model=expected_model)
 
 
 def _wait_for_process_exit(pid, timeout):
@@ -2826,7 +2837,7 @@ def stop_recording(auto_submit=False):
         return _stop_recording(auto_submit=auto_submit)
 
 
-def toggle_recording(auto_submit=None):
+def toggle_recording(auto_submit=None, expected_model=None):
     with _operation_lock() as locked:
         if not locked:
             return False
@@ -2835,7 +2846,7 @@ def toggle_recording(auto_submit=None):
             if auto_submit is None:
                 auto_submit = get_settings()["toggle_action"] == "submit"
             return _stop_recording(auto_submit=auto_submit, pids=pids)
-        return _start_recording()
+        return _start_recording(expected_model=expected_model)
 
 
 def _run_qml_command(command, timeout=QML_JOB_TIMEOUT_SECONDS):
@@ -2883,11 +2894,19 @@ def _usage():
 
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "toggle"
+    expected_model = None
+    if action in {"start", "toggle", "toggle-submit"} and len(sys.argv) > 2:
+        if len(sys.argv) != 3:
+            print("Error: expected at most one model id", file=sys.stderr)
+            sys.exit(1)
+        # Validate at capture start, so an unconfirmed/stale expectation can
+        # still stop existing audio without authorizing a fresh recording.
+        expected_model = sys.argv[2]
 
     if action == "qml-gateway":
         success = _qml_gateway(sys.argv[2:])
     elif action == "start":
-        success = start_recording()
+        success = start_recording(expected_model=expected_model)
     elif action in ("stop", "done", "transcribe"):
         success = stop_recording(auto_submit=False)
     elif action in ("submit", "send"):
@@ -2899,9 +2918,9 @@ if __name__ == "__main__":
     elif action == "cancel":
         success = cancel_recording()
     elif action == "toggle":
-        success = toggle_recording()
+        success = toggle_recording(expected_model=expected_model)
     elif action == "toggle-submit":
-        success = toggle_recording(auto_submit=True)
+        success = toggle_recording(auto_submit=True, expected_model=expected_model)
     elif action == "status":
         print(json.dumps(get_current_state(), separators=(",", ":")))
         success = True
