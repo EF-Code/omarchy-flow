@@ -33,6 +33,8 @@ Item {
   property string audioTestResult: ""
   property string settingsPage: "overview"
   property var settingWriteQueue: []
+  property int settingsRevision: 0
+  readonly property bool preferencesSaving: settingsWriteProcess.running || root.settingWriteQueue.length > 0
 
   readonly property color foreground: Color.popups.text
   readonly property color mutedForeground: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.68)
@@ -120,12 +122,13 @@ Item {
   }
 
   function setPreference(key, value) {
+    root.settingsRevision++
     var command = [root.flowctlPath, "qml", "set-setting", key, String(value)]
-    if (settingsWriteProcess.running || root.settingWriteQueue.length > 0) {
+    if (settingsWriteProcess.running || resetProcess.running || root.settingWriteQueue.length > 0) {
       // Coalesce repeated edits to the same preference while preserving the
       // order of changes to different preferences.
       for (var i = 0; i < root.settingWriteQueue.length; i++) {
-        if (root.settingWriteQueue[i][2] === key) {
+        if (root.settingWriteQueue[i][3] === key) {
           root.settingWriteQueue[i] = command
           return
         }
@@ -138,7 +141,11 @@ Item {
   }
 
   function runNextSettingWrite() {
-    if (settingsWriteProcess.running || root.settingWriteQueue.length === 0) return
+    if (settingsWriteProcess.running || resetProcess.running) return
+    if (root.settingWriteQueue.length === 0) {
+      root.reloadSettings()
+      return
+    }
     settingsWriteProcess.command = root.settingWriteQueue.shift()
     settingsWriteProcess.running = true
   }
@@ -204,7 +211,18 @@ Item {
 
   function resetPreferences() {
     if (resetProcess.running) return
+    if (settingsWriteProcess.running || root.settingWriteQueue.length > 0) {
+      root.notice = "Wait for pending preferences to finish saving"
+      return
+    }
+    root.settingsRevision++
     resetProcess.running = true
+  }
+
+  function reloadSettings() {
+    if (settingsProcess.running || settingsWriteProcess.running || resetProcess.running || root.settingWriteQueue.length > 0) return
+    settingsProcess.revision = root.settingsRevision
+    settingsProcess.running = true
   }
 
   function openKeybindings() {
@@ -217,6 +235,7 @@ Item {
 
   Process {
     id: settingsProcess
+    property int revision: 0
     command: [root.flowctlPath, "qml", "settings"]
     running: true
     stdout: StdioCollector {
@@ -224,6 +243,10 @@ Item {
       waitForEnd: true
     }
     onExited: function(exitCode) {
+      if (revision !== root.settingsRevision || settingsWriteProcess.running || resetProcess.running || root.settingWriteQueue.length > 0) {
+        Qt.callLater(root.reloadSettings)
+        return
+      }
       if (exitCode !== 0 || !settingsOutput.text) return
       try {
         var raw = settingsOutput.text
@@ -422,8 +445,8 @@ Item {
     onExited: function(exitCode) {
       if (exitCode === 0) {
         root.notice = "Flow preferences restored"
-        settingsProcess.running = true
       } else root.notice = "Could not reset preferences"
+      Qt.callLater(root.runNextSettingWrite)
     }
     Component.onDestruction: if (running) running = false
   }
@@ -1304,7 +1327,7 @@ Item {
         foreground: root.foreground
         accent: Color.accent
         bordered: true
-        enabled: !resetProcess.running
+        enabled: !resetProcess.running && !root.preferencesSaving
         onClicked: root.resetPreferences()
       }
 

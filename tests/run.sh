@@ -74,7 +74,7 @@ cp scripts/flowctl "$TEST_XDG_ROOT/qml/scripts/real-flowctl"
 export FLOW_TEST_REAL_FLOWCTL="$TEST_XDG_ROOT/qml/scripts/real-flowctl"
 "$FLOW_TEST_REAL_FLOWCTL" model gemini-3.5-transcribe >/dev/null
 mkdir -m 700 "$TEST_XDG_ROOT/qml/fixtures"
-for mode in fail malformed timeout slow-save write-fails bad-status; do
+for mode in fail malformed timeout slow-save write-fails bad-status slow-settings settings-write-fails; do
   cp tests/model_fixture.sh "$TEST_XDG_ROOT/qml/fixtures/$mode"
   chmod 700 "$TEST_XDG_ROOT/qml/fixtures/$mode"
 done
@@ -90,6 +90,22 @@ if [[ "$QML_STATE_OUTPUT" != *FLOW_MODEL_STATE_TEST_PASS* || "$QML_STATE_OUTPUT"
   exit 1
 fi
 echo "Model selection failure and synchronization runtime OK."
+
+echo ""
+echo "=== Settings Queue and Failed Save Checks ==="
+cp SettingsView.qml FlowDropdown.qml "$TEST_XDG_ROOT/qml/"
+ln -s "$OMARCHY_SHELL_PATH/Commons" "$TEST_XDG_ROOT/qml/Commons"
+ln -s "$OMARCHY_SHELL_PATH/Ui" "$TEST_XDG_ROOT/qml/Ui"
+cp tests/test_settings.qml "$TEST_XDG_ROOT/qml/shell.qml"
+QML_SETTINGS_OUTPUT="$(QT_QPA_PLATFORM=offscreen timeout 20 quickshell -p "$TEST_XDG_ROOT/qml/shell.qml" 2>&1)" || {
+  echo "$QML_SETTINGS_OUTPUT"
+  exit 1
+}
+if [[ "$QML_SETTINGS_OUTPUT" != *FLOW_SETTINGS_TEST_PASS* || "$QML_SETTINGS_OUTPUT" == *FLOW_SETTINGS_TEST_FAIL* ]]; then
+  echo "$QML_SETTINGS_OUTPUT"
+  exit 1
+fi
+echo "Settings queue and failed save runtime OK."
 
 echo ""
 echo "=== 4. Testing CLI Dispatcher (flowctl) ==="

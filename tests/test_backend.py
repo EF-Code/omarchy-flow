@@ -661,6 +661,15 @@ class TestFlowBackend(unittest.TestCase):
         self.assertEqual(payload["code"], 429)
         self.assertNotIn("sensitive-service-error", messages[0].decode())
 
+    def test_cloud_worker_serializes_bounded_transcripts_without_slicing_json(self):
+        for text in ("字" * backend.MAX_TRANSCRIPT_CHARS, "\x00" * backend.MAX_TRANSCRIPT_CHARS):
+            with self.subTest(text_kind=repr(text[:1])):
+                messages = []
+                connection = SimpleNamespace(send_bytes=messages.append, close=lambda: None)
+                with patch.object(backend, "_cloud_transcription_operation", return_value=text):
+                    backend._cloud_transcription_worker(connection, b"audio", "gemini-3.8-flash", "key")
+                self.assertEqual(json.loads(messages[0])["text"], text)
+
     def test_model_dispatch_rejects_unknown_model(self):
         with self.assertRaises(ValueError):
             backend._transcribe_audio("recording.wav", "unsupported-model")
@@ -1091,6 +1100,111 @@ class TestFlowBackend(unittest.TestCase):
             self.assertFalse(backend.start_recording())
         popen.assert_not_called()
         ipc.assert_any_call("setStatus", "Storage Full")
+
+    def test_status_poll_during_restart_does_not_delete_new_pid_markers(self):
+        Path(backend.TEMP_AUDIO).write_bytes(b"R" * 1200)
+        backend.update_runtime_state("recording", pid=111, start_ticks=1)
+        process = SimpleNamespace(pid=4242, returncode=None, poll=lambda: None)
+        write_markers = backend._write_pid_markers
+
+        def poll_after_markers(pid):
+            write_markers(pid)
+            backend.get_current_state()
+
+        with patch.object(backend, "_write_pid_markers", side_effect=poll_after_markers), patch.object(
+            backend, "_is_recorder_process", side_effect=lambda pid: pid == 4242
+        ), patch.object(backend, "_process_alive", side_effect=lambda pid: pid == 4242), patch.object(
+            backend, "_process_start_ticks", return_value=1234
+        ), patch.object(backend, "pill_ipc"), patch.object(backend.time, "sleep"), patch(
+            "subprocess.Popen", return_value=process
+        ):
+            self.assertTrue(backend.start_recording())
+            self.assertEqual(backend._active_recording_pids(), [4242])
+
+    def test_start_aborts_if_authoritative_state_cannot_be_saved(self):
+        write = backend._write_private_text
+
+        def fail_state(path, content):
+            if path == backend.STATE_FILE:
+                raise OSError("simulated full disk")
+            return write(path, content)
+
+        process = SimpleNamespace(pid=4242, returncode=None, poll=lambda: None)
+        with patch.object(backend, "_write_private_text", side_effect=fail_state), patch.object(
+            backend, "_terminate_recorder", return_value=True
+        ) as terminate, patch.object(backend, "_process_start_ticks", return_value=1234), patch.object(
+            backend, "pill_ipc"
+        ), patch.object(backend.time, "sleep"), patch("subprocess.Popen", return_value=process):
+            self.assertFalse(backend.start_recording())
+        terminate.assert_called_once_with(4242, backend.signal.SIGTERM)
+        self.assertFalse(Path(backend.PID_FILE).exists())
+        self.assertFalse(list(Path(backend.RUNTIME_DIR).glob(".cap-*")))
+
+    def test_failed_recorder_shutdown_preserves_capture_for_retry(self):
+        Path(backend.TEMP_AUDIO).write_bytes(b"R" * 1200)
+        backend.update_runtime_state("recording", pid=4242)
+        for action in (backend._stop_recording, backend._cancel_recording):
+            with patch.object(backend, "_active_recording_pids", return_value=[4242]), patch.object(
+                backend, "_terminate_recorder", return_value=False
+            ), patch.object(backend, "_transcribe_audio") as transcribe, patch.object(
+                backend, "_inject_text", return_value=True
+            ), patch.object(backend, "pill_ipc"):
+                self.assertFalse(action())
+            transcribe.assert_not_called()
+            self.assertTrue(Path(backend.TEMP_AUDIO).exists())
+            self.assertTrue(Path(backend.STATE_FILE).exists())
+
+    def test_pause_write_failure_restores_original_recorder_state(self):
+        backend.update_runtime_state("recording", pid=4242, paused=False)
+        with patch.object(backend, "_active_recording_pids", return_value=[4242]), patch.object(
+            backend, "update_runtime_state", side_effect=OSError("simulated full disk")
+        ), patch.object(backend.os, "kill") as kill, patch.object(backend, "pill_ipc"):
+            self.assertFalse(backend.toggle_pause())
+        self.assertEqual([call.args for call in kill.call_args_list], [
+            (4242, backend.signal.SIGSTOP), (4242, backend.signal.SIGCONT)
+        ])
+
+    def test_pause_and_resume_preserve_capture_and_pinned_model(self):
+        target, _capture_dir, capture_fd = backend._create_exclusive_capture_target()
+        os.close(capture_fd)
+        backend.update_runtime_state(
+            "recording", pid=4242, paused=False, audio_path=target,
+            model="gemini-3.5-transcribe",
+        )
+        backend.set_selected_model("whisper-base.en")
+        with patch.object(backend, "_active_recording_pids", return_value=[4242]), patch.object(
+            backend.os, "kill"
+        ) as kill, patch.object(backend, "_process_start_ticks", return_value=1234), patch.object(backend, "pill_ipc"):
+            for action, paused in (
+                (backend.pause_recording, True), (backend.resume_recording, False),
+                (backend.toggle_pause, True), (backend.toggle_pause, False),
+            ):
+                self.assertTrue(action())
+                state = backend._load_runtime_state()
+                self.assertIs(state["paused"], paused)
+                self.assertEqual(state["model"], "gemini-3.5-transcribe")
+                self.assertEqual(state["audio_path"], target)
+        self.assertEqual([call.args for call in kill.call_args_list], [
+            (4242, backend.signal.SIGSTOP), (4242, backend.signal.SIGCONT),
+            (4242, backend.signal.SIGSTOP), (4242, backend.signal.SIGCONT),
+        ])
+
+    def test_private_write_does_not_chmod_substituted_symlink_target(self):
+        victim = Path(self.temp_dir.name) / "unrelated.txt"
+        victim.write_text("keep mode")
+        victim.chmod(0o644)
+        target = Path(backend.SETTINGS_FILE)
+        rename = os.rename
+
+        def swap_after_rename(*args, **kwargs):
+            rename(*args, **kwargs)
+            target.unlink()
+            target.symlink_to(victim)
+
+        with patch.object(backend.os, "rename", side_effect=swap_after_rename):
+            backend._write_private_text(str(target), "private content")
+        self.assertEqual(file_mode(victim), 0o644)
+        self.assertEqual(victim.read_text(), "keep mode")
 
     def test_qml_action_and_status_contracts(self):
         bar = (REPO_ROOT / "BarWidget.qml").read_text()

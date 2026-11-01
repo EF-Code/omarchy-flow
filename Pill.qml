@@ -173,7 +173,10 @@ Item {
         id: hideTimer
         interval: 1000
         onTriggered: {
-            root.isVisible = false
+            if (modelState.isRecording) {
+                root.stateMode = modelState.isPaused ? "paused" : "listening"
+                root.statusText = modelState.isPaused ? "Paused" : "Listening..."
+            } else root.isVisible = false
             root.dropdownOpen = false
         }
     }

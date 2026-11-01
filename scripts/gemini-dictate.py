@@ -144,6 +144,9 @@ MAX_LOG_BYTES = 512 * 1024
 MAX_LOG_BACKUPS = 3
 MAX_TRANSCRIPT_CHARS = 20000
 MAX_TRANSCRIPT_BYTES = 65536
+# JSON can expand each control character to a six-byte escape. Bound the
+# complete IPC envelope separately; never truncate serialized JSON bytes.
+MAX_CLOUD_RESULT_BYTES = MAX_TRANSCRIPT_CHARS * 6 + 2048
 TRANSCRIBE_DEADLINE_SECONDS = 90
 CLOUD_CLEANUP_RESERVE_SECONDS = 5
 CAPTURE_DIR_PREFIX = ".cap-"
@@ -725,11 +728,6 @@ def _write_private_text(path, content):
                     os.close(ffd)
                 except OSError:
                     pass
-        # Also chmod via path for compatibility
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
     finally:
         if tmp_fd is not None:
             try:
@@ -1694,7 +1692,7 @@ def _load_runtime_state():
     return data if isinstance(data, dict) else {}
 
 
-def _valid_recording_pids():
+def _valid_recording_pids(cleanup=True):
     state = _load_runtime_state()
     expected_pid = state.get("pid")
     expected_ticks = state.get("start_ticks")
@@ -1703,25 +1701,29 @@ def _valid_recording_pids():
     for pid_path in [PID_FILE, LEGACY_PID_FILE]:
         pid = _read_pid(pid_path)
         if pid is None:
-            if _owned_path(pid_path, allow_symlink=True) is not None:
+            if cleanup and _owned_path(pid_path, allow_symlink=True) is not None:
                 _remove_owned_path(pid_path)
             continue
         if pid in valid or not _is_recorder_process(pid):
-            _remove_owned_path(pid_path)
+            if cleanup:
+                _remove_owned_path(pid_path)
             continue
 
         if expected_pid is not None:
             try:
                 if int(expected_pid) != pid:
-                    _remove_owned_path(pid_path)
+                    if cleanup:
+                        _remove_owned_path(pid_path)
                     continue
             except (TypeError, ValueError):
-                _remove_owned_path(pid_path)
+                if cleanup:
+                    _remove_owned_path(pid_path)
                 continue
         if expected_ticks is not None:
             current_ticks = _process_start_ticks(pid)
             if current_ticks is None or str(current_ticks) != str(expected_ticks):
-                _remove_owned_path(pid_path)
+                if cleanup:
+                    _remove_owned_path(pid_path)
                 continue
         valid.append(pid)
     return valid
@@ -1903,16 +1905,18 @@ def _operation_lock():
                 pass
 
 
-def is_recording():
-    valid = _valid_recording_pids()
-    if not valid and not _completed_recording_available():
+def is_recording(cleanup=True):
+    valid = _valid_recording_pids(cleanup=cleanup)
+    if cleanup and not valid and not _completed_recording_available():
         # A dead recorder must not leave a stale paused state behind.
         _remove_owned_path(STATE_FILE)
         _remove_owned_path(LEGACY_STATE_FILE)
     return bool(valid)
 
 def get_current_state():
-    rec = is_recording()
+    # Pollers do not hold the operation lock. A recorder may be between its
+    # marker and state writes, so a read must not remove either generation.
+    rec = is_recording(cleanup=False)
     paused = False
     if rec:
         paused = _load_runtime_state().get("paused") is True
@@ -2009,6 +2013,7 @@ def update_runtime_state(status, paused=False, pid=None, start_ticks=None, audio
         _write_private_text(STATE_FILE, json.dumps(state_data, separators=(",", ":")))
     except OSError as error:
         log(f"Error updating runtime state: {type(error).__name__}")
+        raise
     try:
         _write_private_text(LEGACY_STATE_FILE, "paused" if paused else "recording")
     except OSError:
@@ -2213,6 +2218,21 @@ def _active_recording_pids():
     return _valid_recording_pids()
 
 
+def _set_recorder_paused(pid, paused):
+    previous = _load_runtime_state().get("paused") is True
+    os.kill(pid, signal.SIGSTOP if paused else signal.SIGCONT)
+    try:
+        update_runtime_state("paused" if paused else "recording", paused=paused, pid=pid)
+    except OSError:
+        # Preserve the old state machine when a disk error prevents the new
+        # state from being committed; the next toggle must remain usable.
+        try:
+            os.kill(pid, signal.SIGSTOP if previous else signal.SIGCONT)
+        except OSError:
+            pass
+        raise
+
+
 def toggle_pause():
     with _operation_lock() as locked:
         if not locked:
@@ -2224,8 +2244,7 @@ def toggle_pause():
         pid = pids[0]
         paused = _load_runtime_state().get("paused") is True
         try:
-            os.kill(pid, signal.SIGCONT if paused else signal.SIGSTOP)
-            update_runtime_state("recording" if paused else "paused", paused=not paused, pid=pid)
+            _set_recorder_paused(pid, not paused)
             pill_ipc("setResumed" if paused else "setPaused")
             log("Recording resumed" if paused else "Recording paused")
             return True
@@ -2242,8 +2261,7 @@ def resume_recording():
         if not pids:
             return False
         try:
-            os.kill(pids[0], signal.SIGCONT)
-            update_runtime_state("recording", paused=False, pid=pids[0])
+            _set_recorder_paused(pids[0], False)
             pill_ipc("setResumed")
             log("Recording resumed explicitly")
             return True
@@ -2260,8 +2278,7 @@ def pause_recording():
         if not pids:
             return False
         try:
-            os.kill(pids[0], signal.SIGSTOP)
-            update_runtime_state("paused", paused=True, pid=pids[0])
+            _set_recorder_paused(pids[0], True)
             pill_ipc("setPaused")
             log("Recording paused explicitly")
             return True
@@ -2273,8 +2290,10 @@ def pause_recording():
 def _cancel_recording(pids=None):
     log("Cancelling recording")
     pids = _active_recording_pids() if pids is None else pids
-    for pid in pids:
-        _terminate_recorder(pid, signal.SIGTERM)
+    stopped = [_terminate_recorder(pid, signal.SIGTERM) for pid in pids]
+    if not all(stopped):
+        pill_ipc("setStatus", "Recorder still running")
+        return False
     _clear_runtime_markers()
     _clear_audio_files()
     pill_ipc("hide")
@@ -2512,12 +2531,14 @@ def _cloud_transcription_worker(connection, audio_bytes, model_choice, api_key):
                     "event": "cleanup_needed", "name": str(name)[:1024],
                 }, separators=(",", ":")).encode("utf-8"))
 
-        result = _cloud_transcription_operation(
+        result = _bounded_transcript(_cloud_transcription_operation(
             audio_bytes, model_choice, api_key,
             on_upload=report_upload,
             on_cleanup_needed=report_cleanup_needed,
-        )
-        payload = json.dumps({"ok": True, "text": result}, separators=(",", ":")).encode("utf-8")
+        ))
+        payload = json.dumps({"ok": True, "text": result}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(payload) > MAX_CLOUD_RESULT_BYTES:
+            raise ValueError("cloud result exceeds IPC byte ceiling")
     except BaseException as error:
         code = getattr(error, "code", None)
         payload = json.dumps({
@@ -2526,7 +2547,7 @@ def _cloud_transcription_worker(connection, audio_bytes, model_choice, api_key):
             "code": code if type(code) is int else None,
         }, separators=(",", ":")).encode("utf-8")
     try:
-        connection.send_bytes(payload[:MAX_TRANSCRIPT_BYTES + 1024])
+        connection.send_bytes(payload)
     finally:
         connection.close()
 
@@ -2613,7 +2634,7 @@ def _transcribe_cloud(target_audio, model_choice):
             remaining = operation_deadline - time.monotonic()
             if not receive.poll(remaining):
                 break
-            payload = receive.recv_bytes(MAX_TRANSCRIPT_BYTES + 2048)
+            payload = receive.recv_bytes(MAX_CLOUD_RESULT_BYTES)
             message = json.loads(payload.decode("utf-8"))
             if message.get("event") == "uploaded":
                 uploaded_name = str(message.get("name", ""))[:1024]
@@ -2724,8 +2745,10 @@ def _stop_recording(auto_submit=False, pids=None):
     if recording_model not in SUPPORTED_MODEL_IDS:
         recording_model = get_selected_model()
     log(f"Stopping audio recording (auto_submit={auto_submit})")
-    for pid in pids:
-        _terminate_recorder(pid, signal.SIGINT)
+    stopped = [_terminate_recorder(pid, signal.SIGINT) for pid in pids]
+    if not all(stopped):
+        pill_ipc("setStatus", "Recorder still running")
+        return False
 
     # ffmpeg may buffer the WAV header and samples until SIGINT finalizes the
     # seekable output. Resolve the descriptor-validated capture only after the

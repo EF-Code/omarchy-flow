@@ -21,6 +21,13 @@ if [[ "${1:-}" == qml ]]; then
       if [[ "$mode" == write-fails ]]; then exit 1; fi
       if [[ "$mode" == slow-save ]]; then sleep 0.3; fi
       ;;
+    set-setting)
+      if [[ "$mode" == settings-write-fails ]]; then exit 1; fi
+      if [[ "$mode" == slow-settings ]]; then sleep 0.3; fi
+      ;;
+    reset-settings)
+      if [[ "$mode" == slow-settings ]]; then sleep 0.3; fi
+      ;;
   esac
 fi
 fixture_root="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"

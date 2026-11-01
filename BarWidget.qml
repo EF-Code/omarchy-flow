@@ -59,6 +59,7 @@ BarWidget {
     root.menuOpen = false
     root.settingsOpen = true
     settingsView.settingsPage = "overview"
+    settingsView.reloadSettings()
   }
 
   function returnToMenu() {
@@ -123,11 +124,7 @@ BarWidget {
 
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) {
-        if (root.isRecording) {
-          root.runAction("pause")
-        } else {
-          root.toggleRecording()
-        }
+        root.toggleRecording()
       } else if (buttonCode === Qt.LeftButton) {
         root.menuOpen = !root.menuOpen
       }
